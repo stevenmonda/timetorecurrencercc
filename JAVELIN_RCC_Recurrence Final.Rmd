@@ -1,0 +1,6316 @@
+---
+title: "JAVELIN RCC Delayed Recurrence"
+author: "Steven Monda"
+date: "2026-02-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,cache=TRUE, message = FALSE, warning = FALSE,eval=TRUE)
+```
+## Load Necessary Packages
+```{r packages, eval=T}
+library(haven)
+library(limma)
+library(ggbeeswarm)
+library(survival)
+library(randomForest)
+library(ggplot2)
+library(matrixStats)
+library(survminer)
+library(readxl)
+library(readr)
+# library(umap)
+
+library(reshape2)
+library(dplyr)
+library(gtsummary)
+library(reshape2)
+library(ggplot2)
+library(patchwork)
+library(patchwork)
+library(cowplot)
+library(scales)
+library(rms)
+library(gtsummary)
+library(binom)
+library(ComplexHeatmap)
+library(circlize)
+library(fgsea)
+library(msigdbr)
+
+```
+
+## Data Harmonization
+```{r import clinical data}
+response<-read_sas("/Users/smonda/Library/CloudStorage/OneDrive-MichiganMedicine/Research/M vs P/RDS121_2024_12_12T10_04_unzip/adrs.sas7bdat")
+
+medhx<-read_sas("/Users/smonda/Library/CloudStorage/OneDrive-MichiganMedicine/Research/M vs P/RDS121_2024_12_12T10_04_unzip/admh.sas7bdat")
+
+clinbroad<-read_sas("/Users/smonda/Library/CloudStorage/OneDrive-MichiganMedicine/Research/M vs P/RDS121_2024_12_12T10_04_unzip/adsl.sas7bdat")
+
+tte<-read_sas("/Users/smonda/Library/CloudStorage/OneDrive-MichiganMedicine/Research/M vs P/RDS121_2024_12_12T10_04_unzip/adtte.sas7bdat")
+
+#clin broad then subsetted ot only patients that were randomiezed
+
+clin<-subset(clinbroad,clinbroad$ARM %in% c("Avelumab 10 mg/kg IV Q2W in a 6-week cycle + axitinib 5 mg PO BID","Sunitinib 50 mg PO QD on Schedule 4/2"))
+rm(clinbroad)
+
+#again subsets medhx to only patients on trial and their cancer hx
+cancerhx<-subset(medhx,
+                 medhx$MHCAT=="PRIMARY DIAGNOSIS"&
+                 medhx$USUBJID %in% clin$USUBJID)
+
+cancerhx$age<-sub("-.*", "", tte$AGE[match(cancerhx$USUBJID,tte$USUBJID)])
+cancerhx$pdl1<-tte$PDL1FL[match(cancerhx$USUBJID,tte$USUBJID)]
+
+cancerhx$orr<-    subset(response$AVALCAT1,response$PARAMCD=="BOR_C")[match(cancerhx$USUBJID,subset(response$USUBJID,response$PARAMCD=="BOR_C"))]
+
+#Imports processed log2(TPM+1) data from PMID: 39789182 https://pubmed.ncbi.nlm.nih.gov/39789182/
+natjavrna <- read_excel("/Users/smonda/Library/CloudStorage/OneDrive-MichiganMedicine/Research/M vs P/RDS121_2024_12_12T10_04_unzip/43018_2024_896_MOESM2_ESM(4).xlsx", 
+                        sheet = "Supp. Table 3")
+
+natjavclin <-read_excel("~/University of Michigan Dropbox/Steven Monda/@SALAMI LAB/JAVELIN Recurrence Data/43018_2024_896_MOESM2_ESM(4).xlsx", 
+           sheet = "Supp. Table 1", col_types = c("text", 
+                                                  "text", "text", "text", "text", "text", 
+                                                  "text", "text", "text", "numeric", 
+                                                  "text", "text", "text", "numeric", 
+                                                  "numeric", "text", "numeric", "numeric", 
+                                                  "numeric", "numeric", "text", "numeric", 
+                                                  "numeric", "numeric", "numeric", 
+                                                  "numeric", "numeric", "numeric", 
+                                                  "numeric", "numeric", "numeric", 
+                                                  "numeric", "numeric"))
+natjavclin<-subset(natjavclin,natjavclin$Cohort=="JAVELIN-101")
+
+
+tpmjav<-data.frame(t(natjavrna))
+colnames(tpmjav) <- natjavrna$hgnc_symbol
+tpmjav<-tpmjav[-1,]
+tpmjav_num <- data.frame(
+  lapply(tpmjav, function(x) as.numeric(as.character(x))),
+  row.names = rownames(tpmjav),
+  check.names = FALSE
+)
+rm(natjavrna,tpmjav)
+
+#data matching file for reconciling PMID: 39789182 with EMD Serono clinical data, with annotation of metastatic versus primary site for tumor sequencing
+finalmatch <- read_excel("~/University of Michigan Dropbox/Steven Monda/@SALAMI LAB/JAVELIN Recurrence Data/finalmatchwithsitecategory.xlsx")
+
+cancerhx$natid<-finalmatch$UUID[match(cancerhx$USUBJID,finalmatch$USUBJID)]
+
+cancerhx$site<-finalmatch$site[match(cancerhx$USUBJID,finalmatch$USUBJID)]
+
+cancerhx$sitespec<-finalmatch$sitspec[match(cancerhx$USUBJID,finalmatch$USUBJID)]
+
+```
+
+## Identifying Subcohort for Analysis - Recurrent Patients and De Novo Metastatic Patients
+1 of 886 randomized patients did not have any available cancer history (e.g. prior nephrectomy) and was excluded, additional exclusions are as follows
+```{r cohort identificcation}
+
+nephreclist<-unique(subset(tte$USUBJID,tte$NEPHRCBL=="Yes"))
+
+cancerhx$nephrec<-cancerhx$USUBJID %in% nephreclist
+
+#initial consort diagram split - 474 and 411 patients
+consort1nomet<-subset(cancerhx,!cancerhx$MHAJCIM %in% c("M1","M1A","M1B","M1C"))
+consort1met<-subset(cancerhx,cancerhx$MHAJCIM %in% c("M1","M1A","M1B","M1C"))
+#split for De Novo Met and Recurrent Patients, 420 recurrent patients and 296 de novo met
+
+recurrers<-subset(consort1nomet,consort1nomet$USUBJID %in% nephreclist & consort1nomet$MHAJCIT!="T0" & !consort1nomet$MHRCTYP %in% c("NEWLY DIAGNOSED","NO RECURRENCE"))
+
+#number of M0 patients excluded with nephrectomy
+table(consort1nomet$nephrec)
+#number of M0 patients  excluded not documented as recurrent
+table(!consort1nomet$MHRCTYP %in% c("NEWLY DIAGNOSED","NO RECURRENCE"))
+#number of M0 patients with "T0" nephrectomy
+table(consort1nomet$MHAJCIT!="T0")
+
+
+#identify the de novo metastatic patients
+metatpresent<-subset(consort1met, consort1met$MHRCTYP %in% c("NEWLY DIAGNOSED","NO RECURRENCE","UNKNOWN"))
+
+#number of M+ patients documented as recurrence e.g. distant recurrence, locoregional recurrence, recurrence, regional recurrence
+table(consort1met$MHRCTYP %in% c("NEWLY DIAGNOSED","NO RECURRENCE","UNKNOWN"))
+
+#final represents the final cohort for analysis
+final<-rbind(recurrers,metatpresent)
+final$recurrer<-ifelse(final$USUBJID %in% recurrers$USUBJID,"recur","denovo")
+
+rm(consort1nomet,consort1met,recurrers,metatpresent)
+
+#aligning overall survival, progression free survival, overall response rate with final clinical dataframe
+fos<-subset(tte, tte$USUBJID %in% final$USUBJID & tte$PARAMCD=="OS")
+
+
+final<-final[match(fos$USUBJID,final$USUBJID),]
+fpfs<-subset(tte, tte$USUBJID %in% final$USUBJID & tte$PARAMCD=="PFS_P")
+fpfs<-fpfs[match(final$USUBJID,fpfs$USUBJID),]
+fos<-fos[match(final$USUBJID,fos$USUBJID),]
+forr<-subset(response,response$USUBJID %in% final$USUBJID & response$PARAMCD=="BOR_C")
+forr<-forr[match(final$USUBJID,forr$USUBJID),]
+
+# 
+fclin<-subset(clin,clin$USUBJID %in% final$USUBJID)
+#time to response not lined up with final because less patients in a responder category
+fttr<-subset(tte, tte$USUBJID %in% final$USUBJID & tte$PARAMCD=="TTR_C")
+
+
+
+final$timetotrial<-ifelse(final$recurrer=="recur",final$MHTSID,NA)
+final$timetotrialinc<-ifelse(final$recurrer=="recur",final$MHTSID,0)
+
+final$timetotrialc<-ifelse(final$recurrer=="recur",
+  ifelse(final$MHTSID<12,"early",
+                    ifelse(
+                      final$MHTSID>=12&final$MHTSID<60,"intermediate",
+                      ifelse(
+                        final$MHTSID>=60,"late","NAA"
+                        
+                      ))),NA)
+
+final$verylate<-ifelse(final$recurrer=="recur",
+                           ifelse(final$MHTSID>=120,"very late","not"
+                                  
+                                      
+                                    ),"denovo")
+
+final$recistlesions<-fclin$NTGSTB
+final$totallesions<-fclin$NTGSTB+fclin$NNTGSTB
+
+final$ttr<-cancerhx$ttr[match(final$USUBJID,cancerhx$USUBJID)]
+
+final$timetorecur<-ifelse(final$recurrer=="recur",final$MHTSID-final$MHRMDUR,NA)
+final$timetorecurinc<-ifelse(final$recurrer=="recur",final$MHTSID-final$MHRMDUR,0)
+
+
+final$timetorecurc<-ifelse(final$timetorecur<12,"early",
+                    ifelse(
+                      final$timetorecur>=12&final$timetorecur<60,"intermediate",
+                      ifelse(
+                        final$timetorecur>=60,"late","NAA"
+                        
+                      )))
+
+#reconcile available clinical variables from 
+final$sarc<-ifelse(final$natid %in% subset(natjavclin$UUID,natjavclin$Sarcomatoid=="Yes"),TRUE,
+                   ifelse(final$natid %in% subset(natjavclin$UUID,natjavclin$Sarcomatoid=="No"),"FALSE",NA))
+
+final$sitespecclean<-ifelse(final$sitespec %in% c("BRAIN","COLON","SPLEEN"),"OTHER",final$sitespec)
+final$wgii<-natjavclin$wGII[match(final$natid,natjavclin$UUID)]
+final$fscounts<-natjavclin$FS_Counts[match(final$natid,natjavclin$UUID)]
+final$tmb<-natjavclin$TMB_Counts[match(final$natid,natjavclin$UUID)]
+
+final$shrink<-as.numeric(natjavclin$Tumor_Shrinkage[match(final$natid,natjavclin$UUID)])
+
+#Exceptional Response Paper for Mutational Results
+
+natjavmut<-read_excel("~/Library/CloudStorage/OneDrive-MichiganMedicine/Research/M vs P/RDS121_2024_12_12T10_04_unzip/43018_2024_896_MOESM2_ESM(4).xlsx", 
+                      sheet = "Supp. Table 4")
+natjavmut<-subset(natjavmut,natjavmut$UUID %in% natjavclin$UUID)
+
+natjavmut$type<-ifelse(natjavmut$Variant_Classification=="Silent",NA,
+ifelse(natjavmut$Variant_Classification=="Nonsense_Mutation","Nonsense",
+   ifelse(natjavmut$Variant_Classification=="Missense_Mutation","Missense", 
+             ifelse(natjavmut$Variant_Classification %in% c("Frame_Shift_Del","Frame_Shift_Ins"),"Frameshift",
+ifelse(natjavmut$Variant_Classification %in% c("In_Frame_Del","In_Frame_Ins"),"Inframe","Other")))))
+                    
+  
+
+
+final$tls<-natjavclin$TLS_Meylan[match(final$natid,natjavclin$UUID)]
+final$ith<-as.numeric(natjavclin$ITH[match(final$natid,natjavclin$UUID)])
+final$ith[is.infinite(final$ith)] <- NA
+
+final$purity<-natjavclin$Purity[match(final$natid,natjavclin$UUID)]
+final$neoant<-natjavclin$Clonal_Neoantigen_Load[match(final$natid,natjavclin$UUID)]
+final$ith<-natjavclin$ITH[match(final$natid,natjavclin$UUID)]
+final$clonalcall<-final$natid %in% subset(natjavmut$UUID,!is.na(natjavmut$mutation_clonality))
+final$ploidy<-natjavclin$Ploidy[match(final$natid,natjavclin$UUID)]
+
+
+#imdc corrected is used throughout for all downstream analyses, this excludes the time to diagnosis variable as this is embedded within recurrence time so this is an attempt to eliminate structural colinearity, how imdc is represented in the model is assessed further below
+final$imdccorrected<-final$HENGBLN-(final$MHTSID<12)
+
+final$grade<-ifelse(final$MHHISG==""&final$MHFUHR=="",NA,ifelse(
+  final$MHHISG!="",final$MHHISG,final$MHFUHR))
+
+final$tstage<-ifelse(final$MHAJCIT %in% c("T1","T1A","T1B"),"T1",
+                     ifelse(final$MHAJCIT %in% c("T2","T2A","T2B"),"T2", 
+                            ifelse(final$MHAJCIT %in% c("T3","T3A","T3B","T3C","T4"),"T3+",
+                                   ifelse(final$MHAJCIT %in% c("TX","T0",""),NA,NA 
+                                   ))))
+final$initialnstage<-ifelse(final$MHAJCIN %in% c("N1","N2","N3"),"N+",
+                     ifelse(final$MHAJCIN %in% c("NX","T2A","T2B"),"Nx", 
+                            ifelse(final$MHAJCIN %in% c("N0","T3A","T3B","T3C","T4"),"N0",NA
+                                 
+                                   )))
+
+final$categories<-ifelse(final$recurrer!="recur","De Novo Metastatic",final$timetotrialc)
+
+```
+## Stacked Bar Plot for Figure 1
+```{r figure 1}
+
+
+final$tstage2 <- ifelse(is.na(final$tstage), "Unknown", as.character(final$tstage))
+
+final$tstage2 <- factor(final$tstage2,
+                      levels = c("Unknown","T1","T2","T3+"))
+
+final$grade2 <- ifelse(is.na(final$grade), "Unknown", gsub("GRADE ", "", final$grade))
+final$grade2 <- factor(final$grade2,
+                      levels = c("Unknown", "1", "2", "3", "4"))
+
+final$sarc2 <- ifelse(is.na(final$sarc), "Unknown", tools::toTitleCase(tolower(as.character(final$sarc))))
+final$sarc2 <- factor(final$sarc2,
+                      levels = c("Unknown", "False", "True"))
+
+final$imdccorrected2 <- ifelse(is.na(final$imdccorrected), "Unknown",ifelse(final$imdccorrected>2, ">2", as.character(final$imdccorrected)))
+final$imdccorrected2 <- factor(final$imdccorrected2,
+                      levels = c("Unknown","0","1","2"
+                                 ,">2"))
+
+pal_tstage <- c("Unknown"="gray85", "T1"="#b8e186", "T2"="#fde0ef", "T3+"="#c51b7d")
+
+pal_grade <- c("Unknown"="gray85",
+               "1"="#74add1",
+               "2"="#abd9e9",
+               "3"="#fdae61",
+               "4"="#d73027")
+
+pal_sarc <- c("Unknown"="gray85", "False"="#e0f3f8", "True"="#a50026")
+
+pal_imdc <- c("Unknown"="gray85", "0"="#1a9850", "1"="#a6d96a", "2"="#fee08b", ">2"="#f46d43")
+
+sub<-subset(final,final$categories=="De Novo Metastatic")
+
+p1 <- ggplot(sub, aes(x = 1, fill = tstage2)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = pal_tstage, drop = FALSE, name = "T-stage")+
+  labs(y = NULL, x = "T-stage") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.y = element_text(angle = 90, vjust = 0.5))
+
+
+p2 <- ggplot(sub, aes(x = 1, fill = grade2)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) + 
+  scale_fill_manual(values = pal_grade, drop = FALSE, name = "Grade")+
+  labs(y = NULL, x = "Grade") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+                axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_text(angle = 90, vjust = 0.5))
+
+p3 <- ggplot(sub, aes(x = 1, fill = factor(imdccorrected2))) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = pal_imdc, drop = FALSE, name = "Adjusted IMDC")+
+  labs(y = NULL, x = "IMDC*") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+                axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_text(angle = 90, vjust = 0.5))
+
+p4 <- ggplot(sub, aes(x = 1, fill = factor(sarc2))) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = pal_sarc, drop = FALSE, name = "Sarcomatoid")+
+  labs(y = NULL, x = "Sarc.") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_text(angle = 90, vjust = 0.5))
+
+leg_tstage <- get_legend(
+  p1 + theme(legend.position="bottom")
+)
+
+leg_grade <- get_legend(
+  p2 +
+    theme(legend.position = "bottom") +
+    guides(fill = guide_legend(nrow = 1, byrow = TRUE))
+)
+
+leg_imdc <- get_legend(
+  p3 + theme(legend.position="bottom")
+)
+
+leg_sarc <- get_legend(
+  p4 + theme(legend.position="bottom")
+)
+leg_all <- plot_grid(
+  leg_tstage,
+  leg_grade,
+  leg_imdc,
+  leg_sarc,
+  nrow = 2
+)
+
+
+  p1 <- p1 + theme(legend.position="none",
+     plot.margin = ggplot2::margin(0, 0, 0, 0))
+  p2 <- p2 + theme(legend.position="none",
+    plot.margin = ggplot2::margin(0, 0, 0, 0))
+  p3 <- p3 + theme(legend.position="none",
+  plot.margin = ggplot2::margin(0, 0, 0, 0))
+  p4 <- p4 + theme(legend.position="none",
+   plot.margin = ggplot2::margin(0, 0, 0, 0))
+  
+p_combined <- plot_grid(
+  p1, p2, p3,p4,
+  ncol = 1,
+  align = "v",
+  axis = "lr",
+  rel_heights = c(1, 1, 1)
+)
+
+p_denovo<-p_combined
+
+
+sub<-subset(final,final$categories=="early")
+
+p1 <- ggplot(sub, aes(x = 1, fill = tstage2)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = pal_tstage, drop = FALSE, name = "T-stage")+
+  labs(y = NULL, x = "T-stage") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.y = element_text(angle = 90, vjust = 0.5))
+
+
+p2 <- ggplot(sub, aes(x = 1, fill = grade2)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) + 
+  scale_fill_manual(values = pal_grade, drop = FALSE, name = "Grade")+
+  labs(y = NULL, x = "Grade") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+                axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_text(angle = 90, vjust = 0.5))
+
+p3 <- ggplot(sub, aes(x = 1, fill = factor(imdccorrected2))) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = pal_imdc, drop = FALSE, name = "Adjusted IMDC")+
+  labs(y = NULL, x = "IMDC*") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+                axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_text(angle = 90, vjust = 0.5))
+
+p4 <- ggplot(sub, aes(x = 1, fill = factor(sarc2))) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = pal_sarc, drop = FALSE, name = "Sarcomatoid")+
+  labs(y = NULL, x = "Sarc.") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_text(angle = 90, vjust = 0.5))
+
+  p1 <- p1 + theme(legend.position="none",
+     plot.margin = ggplot2::margin(0, 0, 0, 0))
+  p2 <- p2 + theme(legend.position="none",
+    plot.margin = ggplot2::margin(0, 0, 0, 0))
+  p3 <- p3 + theme(legend.position="none",
+  plot.margin = ggplot2::margin(0, 0, 0, 0))
+  p4 <- p4 + theme(legend.position="none",
+   plot.margin = ggplot2::margin(0, 0, 0, 0))
+
+p_combined <- plot_grid(
+  p1, p2, p3,p4,
+  ncol = 1,
+  align = "v",
+  axis = "lr",
+  rel_heights = c(1, 1, 1)
+)
+
+p_early<-p_combined
+
+sub<-subset(final,final$categories=="intermediate")
+
+p1 <- ggplot(sub, aes(x = 1, fill = tstage2)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = pal_tstage, drop = FALSE, name = "T-stage")+
+  labs(y = NULL, x = "T-stage") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.y = element_text(angle = 90, vjust = 0.5))
+
+
+p2 <- ggplot(sub, aes(x = 1, fill = grade2)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) + 
+  scale_fill_manual(values = pal_grade, drop = FALSE, name = "Grade")+
+  labs(y = NULL, x = "Grade") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+                axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_text(angle = 90, vjust = 0.5))
+
+p3 <- ggplot(sub, aes(x = 1, fill = factor(imdccorrected2))) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = pal_imdc, drop = FALSE, name = "Adjusted IMDC")+
+  labs(y = NULL, x = "IMDC*") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+                axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_text(angle = 90, vjust = 0.5))
+
+p4 <- ggplot(sub, aes(x = 1, fill = factor(sarc2))) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = pal_sarc, drop = FALSE, name = "Sarcomatoid")+
+  labs(y = NULL, x = "Sarc.") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_text(angle = 90, vjust = 0.5))
+
+  p1 <- p1 + theme(legend.position="none",
+     plot.margin = ggplot2::margin(0, 0, 0, 0))
+  p2 <- p2 + theme(legend.position="none",
+    plot.margin = ggplot2::margin(0, 0, 0, 0))
+  p3 <- p3 + theme(legend.position="none",
+  plot.margin = ggplot2::margin(0, 0, 0, 0))
+  p4 <- p4 + theme(legend.position="none",
+   plot.margin = ggplot2::margin(0, 0, 0, 0))
+
+p_combined <- plot_grid(
+  p1, p2, p3,p4,
+  ncol = 1,
+  align = "v",
+  axis = "lr",
+  rel_heights = c(1, 1, 1)
+)
+
+p_int<-p_combined
+
+
+sub<-subset(final,final$categories=="late")
+
+p1 <- ggplot(sub, aes(x = 1, fill = tstage2)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = pal_tstage, drop = FALSE, name = "T-stage")+
+  labs(y = NULL, x = "T-stage") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.y = element_text(angle = 90, vjust = 0.5))
+
+
+p2 <- ggplot(sub, aes(x = 1, fill = grade2)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) + 
+  scale_fill_manual(values = pal_grade, drop = FALSE, name = "Grade")+
+  labs(y = NULL, x = "Grade") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+                axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_text(angle = 90, vjust = 0.5))
+
+p3 <- ggplot(sub, aes(x = 1, fill = factor(imdccorrected2))) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = pal_imdc, drop = FALSE, name = "Adjusted IMDC")+
+  labs(y = NULL, x = "IMDC*") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+                axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_text(angle = 90, vjust = 0.5))
+
+p4 <- ggplot(sub, aes(x = 1, fill = factor(sarc2))) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = pal_sarc, drop = FALSE, name = "Sarcomatoid")+
+  labs(y = NULL, x = "Sarc.") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid = element_blank(),
+        axis.title.x = element_text(angle = 90, vjust = 0.5))
+
+  p1 <- p1 + theme(legend.position="none",
+     plot.margin = ggplot2::margin(0, 0, 0, 0))
+  p2 <- p2 + theme(legend.position="none",
+    plot.margin = ggplot2::margin(0, 0, 0, 0))
+  p3 <- p3 + theme(legend.position="none",
+  plot.margin = ggplot2::margin(0, 0, 0, 0))
+  p4 <- p4 + theme(legend.position="none",
+   plot.margin = ggplot2::margin(0, 0, 0, 0))
+
+p_combined <- plot_grid(
+  p1, p2, p3,p4,
+  ncol = 1,
+  align = "v",
+  axis = "lr",
+  rel_heights = c(1, 1, 1)
+)
+
+p_late<-p_combined
+
+p_top <- plot_grid(
+  p_denovo, p_early,p_int,p_late,
+  ncol = 4,
+  align = "h"
+)
+
+leg_all <- plot_grid(
+  leg_tstage,
+  leg_grade,
+  leg_imdc,
+  leg_sarc,
+  nrow = 2
+)
+
+margin_theme <- theme(plot.margin = ggplot2::margin(t = 5, r = 5, b = 15, l = 5))
+
+p_top <- plot_grid(
+  p_denovo + margin_theme,
+  p_early + margin_theme,
+  p_int + margin_theme,
+  p_late + margin_theme,
+  ncol = 4,
+  align = "h")
+
+  final_plot <- plot_grid(
+  p_top,
+  leg_all,
+  ncol = 1,
+  rel_heights = c(1, 0.2)
+)
+
+
+
+final_plot
+#to be combined with biorender
+
+```
+
+
+
+
+## Establishing Data Sets for Survival Analysis e.g. Prognostic Association of Recurrence Status and 
+
+```{r dataset housekeeping for analysis}
+
+fpfs$categories<-final$categories
+fos$categories<-final$categories
+fpfs$imdc<-final$imdccorrected
+
+fpfs$timetotrial<-final$timetotrial
+fpfs$timetotrialinc<-final$timetotrialinc
+
+fpfs$heng<-final$HENGBL
+fos$imdc<-final$imdccorrected
+fos$heng<-final$HENGBL
+
+final$ecog<-fos$STRATI1N
+
+
+
+
+```
+
+
+##Table 1 Clinical Data Summary
+
+```{r clinical data Summary}
+
+
+final$pdl1<-ifelse(final$pdl1=="Y",TRUE,
+                   ifelse(final$pdl1=="N",FALSE,NA))
+                   
+final$age<-as.numeric(final$age)
+tbl_summary(
+  final,
+  by = categories,
+  include = c(
+    SEX, age, ecog,nephrec, MHLAT, tstage,initialnstage, grade,
+    pdl1, imdccorrected, sarc, site
+  ),
+  type = list(age ~ "continuous"),
+  statistic = list(age ~ "{median} ({p25}, {p75})")  # optional formatting
+)
+
+
+
+```
+
+## Comparing aggressive clinical features
+```{r Aggressive clinical feature comparison}
+
+
+
+tab <- table(final$categories, final$tstage=="T3+")
+
+binom.confint(
+    tab[, "TRUE"],
+    rowSums(
+      tab),
+    method = "wilson"
+)
+
+anova(glm(final$tstage=="T3+"~ final$categories, family = binomial),test="LRT")
+
+
+
+tab <- table(final$categories, final$initialnstage == "N+")
+
+binom.confint(
+    tab[, "TRUE"],
+    rowSums(
+      tab),
+    method = "wilson"
+)
+
+anova(glm(final$initialnstage == "N+"~ final$categories, family = binomial),test="LRT")
+
+
+
+
+tab <- table(final$categories, final$grade %in% c("GRADE 3","GRADE 4"))
+
+binom.confint(
+    tab[, "TRUE"],
+    rowSums(
+      tab),
+    method = "wilson"
+)
+
+tab <- table(final$categories, final$sarc=="TRUE")
+
+binom.confint(
+    tab[, "TRUE"],
+    rowSums(
+      tab),
+    method = "wilson"
+)
+
+anova(glm(final$sarc=="TRUE" ~ final$categories, family = binomial),test="LRT")
+
+
+
+tab <- table(final$categories, final$pdl1)
+
+binom.confint(
+    tab[, "TRUE"],
+    rowSums(
+      tab),
+    method = "wilson"
+)
+
+anova(glm(final$pdl1=="TRUE" ~ final$categories, family = binomial),test="LRT")
+
+
+
+tab <- table(final$categories, final$imdccorrected>1)
+
+binom.confint(
+    tab[, "TRUE"],
+    rowSums(
+      tab),
+    method = "wilson"
+)
+
+anova(glm(final$imdccorrected>1 ~ final$categories, family = binomial),test="LRT")
+
+```
+
+
+## Mutation Analysis
+
+```{r mutation analysis}
+
+  #479 in mutation dataframe, 479 with genes included
+#for this VHL, PBRM1, BAP1, SETD2, KDM5C, MTOR, TSC2, PIK3CA, PTEN, TP53
+
+
+
+#all patients with TMB are listed in mutation file
+#register cna level data
+
+CNAs <- read_delim("~/Library/CloudStorage/OneDrive-MichiganMedicine/Research/recurrence javelin/gistic_CNAs_JAVELIN101_UUID.tsv", 
+    delim = "\t", escape_double = FALSE, 
+    trim_ws = TRUE)
+
+final$cna9p213<-CNAs$`9p21.3`[match(final$natid,CNAs$sample)]
+final$cna3p2131<-CNAs$`3p21.31`[match(final$natid,CNAs$sample)]
+final$cna14q112<-CNAs$`14q11.2`[match(final$natid,CNAs$sample)]
+final$cna14q3233<-CNAs$`14q32.33`[match(final$natid,CNAs$sample)]
+final$cna5q351<-CNAs$`5q35.1`[match(final$natid,CNAs$sample)]
+final$cna5q313<-CNAs$`5q31.3`[match(final$natid,CNAs$sample)]
+
+
+#?TP53?
+final$cna17p131<-CNAs$`17p13.1`[match(final$natid,CNAs$sample)]
+
+final$cna17q253<-CNAs$`17q25.3`[match(final$natid,CNAs$sample)]
+#MYC Gain- not that impressive
+final$cna8q243<-CNAs$`8q24.3`[match(final$natid,CNAs$sample)]
+final$cna1p3611<-CNAs$`1p36.11`[match(final$natid,CNAs$sample)]
+final$cna1p3631<-CNAs$`1p36.31`[match(final$natid,CNAs$sample)]
+final$cna8q243<-CNAs$`8q24.3`[match(final$natid,CNAs$sample)]
+final$cna20q13<-CNAs$`20q13.33`[match(final$natid,CNAs$sample)]
+
+
+
+fit <- lm(final$cna9p213=="-1" ~ categories + site, data = final)
+# Reduced model (no recurrence timing)
+fit_reduced <- lm(cna9p213=="-1" ~ site, data = final)
+
+final$loss9p<- final$cna9p213 == "-1"
+final$loss3p <- final$cna3p2131 == "-1"
+final$loss14q <- final$cna14q3233 == "-1"
+
+final$ch9p<- ifelse(final$cna9p213 == "-1","Deletion","")
+final$ch3p <- ifelse(final$cna3p2131 == "-1","Deletion","")
+final$ch14q <- ifelse(final$cna14q3233 == "-1","Deletion","")
+# 
+# fit_reduced <- glm(loss9p ~ site, data = final, family = binomial)
+# fit         <- glm(loss9p ~ categories + site , data = final, family = binomial)
+# anova(fit_reduced, fit, test= "LRT")
+# 
+# fit_reduced <- glm(loss3p ~ site, data = final, family = binomial)
+# fit         <- glm(loss3p ~ categories + site , data = final, family = binomial)
+# anova(fit_reduced, fit, test= "LRT")
+# 
+# fit_reduced <- glm(loss14q ~ site, data = final, family = binomial)
+# fit         <- glm(loss14q ~ categories + site , data = final, family = binomial)
+# anova(fit_reduced, fit, test= "LRT")
+# 
+
+# Likelihood ratio test
+
+
+
+
+final$CNA<-final$natid %in% CNAs$sample
+final$WES<-final$natid %in% natjavmut$UUID
+final$VHL<-ifelse(!final$WES,NA,
+       subset(natjavmut$type,natjavmut$Hugo_Symbol=="VHL"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="VHL"&!is.na(natjavmut$type)))] )
+final$VHL<-ifelse(!is.na(final$VHL),final$VHL,
+                  ifelse(final$WES,"",NA
+                  ))
+final$VHLcl<-ifelse(!final$WES,NA,
+       subset(natjavmut$mutation_clonality,natjavmut$Hugo_Symbol=="VHL"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="VHL"&!is.na(natjavmut$type)))] )     
+
+final$VHLcl<-ifelse(!is.na(final$VHLcl),final$VHLcl,
+                     ifelse(final$clonalcall,"",NA))
+        
+
+#----
+final$PBRM1<-ifelse(!final$WES,NA,
+       subset(natjavmut$type,natjavmut$Hugo_Symbol=="PBRM1"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="PBRM1"&!is.na(natjavmut$type)))])
+final$PBRM1<-ifelse(!is.na(final$PBRM1),final$PBRM1,
+                  ifelse(final$WES,"",NA
+                  ))
+         
+final$PBRM1cl<-ifelse(!final$WES,NA,
+       subset(natjavmut$mutation_clonality,natjavmut$Hugo_Symbol=="PBRM1"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="PBRM1"&!is.na(natjavmut$type)))])
+
+
+final$PBRM1cl<-ifelse(!is.na(final$PBRM1cl),final$PBRM1cl,
+                     ifelse(final$clonalcall,"",NA))
+        
+#----
+final$BAP1<-ifelse(!final$WES,NA,
+       subset(natjavmut$type,natjavmut$Hugo_Symbol=="BAP1"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="BAP1"&!is.na(natjavmut$type)))])
+final$BAP1<-ifelse(!is.na(final$BAP1),final$BAP1,
+                  ifelse(final$WES,"",NA
+                  ))
+
+final$BAP1cl<-ifelse(!final$WES,NA,
+       subset(natjavmut$mutation_clonality,natjavmut$Hugo_Symbol=="BAP1"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="BAP1"&!is.na(natjavmut$type)))])
+
+
+final$BAP1cl<-ifelse(!is.na(final$BAP1cl),final$BAP1cl,
+                     ifelse(final$clonalcall,"",NA))
+
+#----
+final$SETD2<-ifelse(!final$WES,NA,
+       subset(natjavmut$type,natjavmut$Hugo_Symbol=="SETD2"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="SETD2"&!is.na(natjavmut$type)))] )
+final$SETD2<-ifelse(!is.na(final$SETD2),final$SETD2,
+                  ifelse(final$WES,"",NA
+                  ))
+
+final$SETD2cl<-ifelse(!final$WES,NA,
+       subset(natjavmut$mutation_clonality,natjavmut$Hugo_Symbol=="SETD2"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="SETD2"&!is.na(natjavmut$type)))] )
+
+
+final$SETD2cl<-ifelse(!is.na(final$SETD2cl),final$SETD2cl,
+                     ifelse(final$clonalcall,"",NA))
+
+#----
+final$KDM5C<-ifelse(!final$WES,NA,
+       subset(natjavmut$type,natjavmut$Hugo_Symbol=="KDM5C"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="KDM5C"&!is.na(natjavmut$type)))])
+
+
+final$KDM5C<-ifelse(!is.na(final$KDM5C),final$KDM5C,
+                  ifelse(final$WES,"",NA
+                  ))
+
+final$KDM5Ccl<-ifelse(!final$WES,NA,
+       subset(natjavmut$mutation_clonality,natjavmut$Hugo_Symbol=="KDM5C"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="KDM5C"&!is.na(natjavmut$type)))]
+                        )
+
+
+final$KDM5Ccl<-ifelse(!final$WES,NA,
+       subset(natjavmut$mutation_clonality,natjavmut$Hugo_Symbol=="KDM5C"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="KDM5C"&!is.na(natjavmut$type)))])
+
+final$KDM5Ccl<-ifelse(!is.na(final$KDM5Ccl),final$KDM5Ccl,
+                     ifelse(final$clonalcall,"",NA))
+
+#----
+final$MTOR<-ifelse(!final$WES,NA,
+       subset(natjavmut$type,natjavmut$Hugo_Symbol=="MTOR"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="MTOR"&!is.na(natjavmut$type)))])
+
+final$MTORcl<-ifelse(!final$WES,NA,
+       subset(natjavmut$mutation_clonality,natjavmut$Hugo_Symbol=="MTOR"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="MTOR"&!is.na(natjavmut$type)))]
+                        )
+
+final$MTORcl<-ifelse(!is.na(final$MTORcl),final$MTORcl,
+                     ifelse(final$clonalcall,"",NA))
+
+final$MTOR<-ifelse(!is.na(final$MTOR),final$MTOR,
+                  ifelse(final$WES,"",NA
+                  ))
+
+#----
+final$TSC2<-ifelse(!final$WES,NA,
+       subset(natjavmut$type,natjavmut$Hugo_Symbol=="TSC2"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="TSC2"&!is.na(natjavmut$type)))])
+final$TSC2<-ifelse(!is.na(final$TSC2),final$TSC2,
+                  ifelse(final$WES,"",NA
+                  ))
+final$TSC2cl<-ifelse(!final$WES,NA,
+       subset(natjavmut$mutation_clonality,natjavmut$Hugo_Symbol=="TSC2"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="TSC2"&!is.na(natjavmut$type)))])
+
+final$TSC2cl<-ifelse(!is.na(final$TSC2cl),final$TSC2cl,
+                     ifelse(final$clonalcall,"",NA))
+
+#----
+final$PIK3CA<-ifelse(!final$WES,NA,
+       subset(natjavmut$type,natjavmut$Hugo_Symbol=="PIK3CA"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="PIK3CA"&!is.na(natjavmut$type)))])
+
+final$PIK3CAcl<-ifelse(!final$WES,NA,
+       subset(natjavmut$mutation_clonality,natjavmut$Hugo_Symbol=="PIK3CA"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="PIK3CA"&!is.na(natjavmut$type)))])
+
+final$PIK3CAcl<-ifelse(!is.na(final$PIK3CAcl),final$PIK3CAcl,
+                     ifelse(final$clonalcall,"",NA))
+
+final$PIK3CA<-ifelse(!is.na(final$PIK3CA),final$PIK3CA,
+                  ifelse(final$WES,"",NA
+                  ))
+
+#----
+final$TP53<-ifelse(!final$WES,NA,
+       subset(natjavmut$type,natjavmut$Hugo_Symbol=="TP53"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="TP53"&!is.na(natjavmut$type)))])
+
+final$TP53cl<-ifelse(!final$WES,NA,
+       subset(natjavmut$mutation_clonality,natjavmut$Hugo_Symbol=="TP53"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="TP53"&!is.na(natjavmut$type)))])
+
+final$TP53cl<-ifelse(!is.na(final$TP53cl),final$TP53cl,
+                     ifelse(final$clonalcall,"",NA))
+
+final$TP53<-ifelse(!is.na(final$TP53),final$TP53,
+                  ifelse(final$WES,"",NA
+                  ))
+
+#----
+final$PTEN<-ifelse(!final$WES,NA,
+       subset(natjavmut$type,natjavmut$Hugo_Symbol=="PTEN"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="PTEN"&!is.na(natjavmut$type)))])
+
+final$PTENcl<-ifelse(!final$WES,NA,
+       subset(natjavmut$mutation_clonality,natjavmut$Hugo_Symbol=="PTEN"&!is.na(natjavmut$type))
+       [match(final$natid,                    subset(natjavmut$UUID,natjavmut$Hugo_Symbol=="PTEN"&!is.na(natjavmut$type)))])
+
+final$PTENcl<-ifelse(!is.na(final$PTENcl),final$PTENcl,
+                     ifelse(final$clonalcall,"",NA))
+
+final$PTEN<-ifelse(!is.na(final$PTEN),final$PTEN,                  ifelse(final$WES,"",NA
+                  ))
+
+#479 in mutation dataframe, 479 with genes included
+#for this VHL, PBRM1, BAP1, SETD2, KDM5C, MTOR, TSC2, PIK3CA, PTEN, TP53
+oncoprint<-subset(final,final$WES&final$categories=="De Novo Metastatic")
+
+genes <- c(
+  "VHL","PBRM1","BAP1","SETD2","KDM5C",
+  "MTOR","PIK3CA","PTEN","TP53"
+)
+
+mat <- t(as.matrix(oncoprint[, genes]))
+colnames(mat) <- oncoprint$natid
+
+
+col <- c(
+  Missense = "#e6ab02",
+  Nonsense = "#d95f02",
+  Frameshift = "#66a61e",
+  Inframe = "#e7298a",
+  Other = "#7570b3"
+)
+
+
+alter_fun <- list(
+  background = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = "#F0F0F0", col = NA)
+    ),
+
+  Missense = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Missense"], col = NA)
+    ),
+
+  Nonsense = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Nonsense"], col = NA)
+    ),
+
+  Frameshift = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Frameshift"], col = NA)
+    ),
+
+  Inframe = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Inframe"], col = NA)
+    ),
+
+  Other = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Other"], col = NA)
+    )
+)
+
+wgii_col <- colorRamp2(
+  c(min(oncoprint$wgii, na.rm = TRUE),
+    median(oncoprint$wgii, na.rm = TRUE),
+    max(oncoprint$wgii, na.rm = TRUE)),
+  c("#F0F0F0", "#feb24c", "#bd0026")
+)
+
+oncoprint$logTMB <- log10(oncoprint$tmb + 1)
+
+tmb_col <- colorRamp2(
+  c(min(oncoprint$logTMB, na.rm = TRUE),
+    median(oncoprint$logTMB, na.rm = TRUE),
+    max(oncoprint$logTMB, na.rm = TRUE)),
+  c("#F7FBFF", "#9ecae1", "#08306B")
+)
+
+top_anno <- HeatmapAnnotation(
+  WGII = oncoprint$wgii,
+  TMB = oncoprint$logTMB,
+  col = list(
+    WGII = wgii_col,
+    TMB = tmb_col
+  ),
+  annotation_name_side = "left",
+  simple_anno_size = unit(7, "mm")
+)
+
+
+dnonco <- oncoPrint(
+  mat,
+  alter_fun = alter_fun,
+  col = col,
+  top_annotation = top_anno,
+  remove_empty_columns = TRUE,
+  remove_empty_rows = TRUE,
+  show_column_names = FALSE,
+  show_row_names = TRUE,
+  row_names_side = "left",
+  row_order = seq_len(nrow(mat)),
+  pct_side="right",
+  right_annotation = NULL
+)
+dn<-draw(dnonco, show_heatmap_legend = FALSE,
+  show_annotation_legend = FALSE,)
+
+
+
+
+##########
+oncoprint<-subset(final,final$WES
+                  &final$categories=="early"
+                  )
+
+genes <- c(
+  "VHL","PBRM1","BAP1","SETD2","KDM5C",
+  "MTOR","PIK3CA","PTEN","TP53"
+)
+
+mat <- t(as.matrix(oncoprint[, genes]))
+colnames(mat) <- oncoprint$natid
+
+
+col <- c(
+  Missense = "#e6ab02",
+  Nonsense = "#d95f02",
+  Frameshift = "#66a61e",
+  Inframe = "#e7298a",
+  Other = "#7570b3"
+)
+
+
+alter_fun <- list(
+  background = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = "#F0F0F0", col = NA)
+    ),
+
+  Missense = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Missense"], col = NA)
+    ),
+
+  Nonsense = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Nonsense"], col = NA)
+    ),
+
+  Frameshift = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Frameshift"], col = NA)
+    ),
+
+  Inframe = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Inframe"], col = NA)
+    ),
+
+  Other = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Other"], col = NA)
+    )
+)
+
+wgii_col <- colorRamp2(
+  c(min(oncoprint$wgii, na.rm = TRUE),
+    median(oncoprint$wgii, na.rm = TRUE),
+    max(oncoprint$wgii, na.rm = TRUE)),
+  c("#F0F0F0", "#feb24c", "#bd0026")
+)
+
+oncoprint$logTMB <- log10(oncoprint$tmb + 1)
+
+tmb_col <- colorRamp2(
+  c(min(oncoprint$logTMB, na.rm = TRUE),
+    median(oncoprint$logTMB, na.rm = TRUE),
+    max(oncoprint$logTMB, na.rm = TRUE)),
+  c("#F7FBFF", "#9ecae1", "#08306B")
+)
+
+top_anno <- HeatmapAnnotation(
+  WGII = oncoprint$wgii,
+  TMB = oncoprint$logTMB,
+  col = list(
+    WGII = wgii_col,
+    TMB = tmb_col
+  ),
+show_annotation_name = FALSE, 
+  simple_anno_size = unit(7, "mm")
+)
+
+
+eonco <- oncoPrint(
+  mat,
+  alter_fun = alter_fun,
+  col = col,
+  top_annotation = top_anno,
+  remove_empty_columns = TRUE,
+  remove_empty_rows = TRUE,
+  show_column_names = FALSE,
+  show_row_names = FALSE,
+  row_names_side = "left",
+  row_order = seq_len(nrow(mat)),
+  right_annotation = NULL,
+  pct_side="right"
+)
+e<-draw(eonco, show_heatmap_legend = FALSE,
+  show_annotation_legend = FALSE,)
+
+##########
+oncoprint<-subset(final,final$WES
+                  &final$categories=="intermediate"
+                  )
+
+genes <- c(
+  "VHL","PBRM1","BAP1","SETD2","KDM5C",
+  "MTOR","PIK3CA","PTEN","TP53"
+)
+
+mat <- t(as.matrix(oncoprint[, genes]))
+colnames(mat) <- oncoprint$natid
+
+
+col <- c(
+  Missense = "#e6ab02",
+  Nonsense = "#d95f02",
+  Frameshift = "#66a61e",
+  Inframe = "#e7298a",
+  Other = "#7570b3"
+)
+
+
+alter_fun <- list(
+  background = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = "#F0F0F0", col = NA)
+    ),
+
+  Missense = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Missense"], col = NA)
+    ),
+
+  Nonsense = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Nonsense"], col = NA)
+    ),
+
+  Frameshift = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Frameshift"], col = NA)
+    ),
+
+  Inframe = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Inframe"], col = NA)
+    ),
+
+  Other = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Other"], col = NA)
+    )
+)
+
+wgii_col <- colorRamp2(
+  c(min(oncoprint$wgii, na.rm = TRUE),
+    median(oncoprint$wgii, na.rm = TRUE),
+    max(oncoprint$wgii, na.rm = TRUE)),
+  c("#F0F0F0", "#feb24c", "#bd0026")
+)
+
+oncoprint$logTMB <- log10(oncoprint$tmb + 1)
+
+tmb_col <- colorRamp2(
+  c(min(oncoprint$logTMB, na.rm = TRUE),
+    median(oncoprint$logTMB, na.rm = TRUE),
+    max(oncoprint$logTMB, na.rm = TRUE)),
+  c("#F7FBFF", "#9ecae1", "#08306B")
+)
+
+top_anno <- HeatmapAnnotation(
+  WGII = oncoprint$wgii,
+  TMB = oncoprint$logTMB,
+  col = list(
+    WGII = wgii_col,
+    TMB = tmb_col
+  ),show_annotation_name = FALSE, 
+  simple_anno_size = unit(7, "mm")
+)
+
+
+ionco <- oncoPrint(
+  mat,
+  alter_fun = alter_fun,
+  col = col,
+  top_annotation = top_anno,
+  remove_empty_columns = TRUE,
+  remove_empty_rows = TRUE,
+  show_column_names = FALSE,
+  show_row_names = FALSE,
+  row_names_side = "left",
+  row_order = seq_len(nrow(mat)),
+  right_annotation = NULL,
+  pct_side="right"
+)
+i<-draw(ionco, show_heatmap_legend = FALSE,
+  show_annotation_legend = FALSE,)
+
+finalm<-subset(final,final$site=="KIDNEY")
+
+##########
+oncoprint<-subset(final,final$WES
+                  &final$categories=="late"
+                  )
+
+genes <- c(
+  "VHL","PBRM1","BAP1","SETD2","KDM5C",
+  "MTOR","PIK3CA","PTEN","TP53"
+)
+
+mat <- t(as.matrix(oncoprint[, genes]))
+colnames(mat) <- oncoprint$natid
+
+
+col <- c(
+  Missense = "#e6ab02",
+  Nonsense = "#d95f02",
+  Frameshift = "#66a61e",
+  Inframe = "#e7298a",
+  Other = "#7570b3"
+)
+
+
+alter_fun <- list(
+  background = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = "#F0F0F0", col = NA)
+    ),
+
+  Missense = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Missense"], col = NA)
+    ),
+
+  Nonsense = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Nonsense"], col = NA)
+    ),
+
+  Frameshift = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Frameshift"], col = NA)
+    ),
+
+  Inframe = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Inframe"], col = NA)
+    ),
+
+  Other = function(x, y, w, h)
+    grid::grid.rect(x, y, w, h,
+      gp = grid::gpar(fill = col["Other"], col = NA)
+    )
+)
+
+wgii_col <- colorRamp2(
+  c(min(oncoprint$wgii, na.rm = TRUE),
+    median(oncoprint$wgii, na.rm = TRUE),
+    max(oncoprint$wgii, na.rm = TRUE)),
+  c("#F0F0F0", "#feb24c", "#bd0026")
+)
+
+oncoprint$logTMB <- log10(oncoprint$tmb + 1)
+
+tmb_col <- colorRamp2(
+  c(min(oncoprint$logTMB, na.rm = TRUE),
+    median(oncoprint$logTMB, na.rm = TRUE),
+    max(oncoprint$logTMB, na.rm = TRUE)),
+  c("#F7FBFF", "#9ecae1", "#08306B")
+)
+
+top_anno <- HeatmapAnnotation(
+  WGII = oncoprint$wgii,
+  TMB = oncoprint$logTMB,
+  col = list(
+    WGII = wgii_col,
+    TMB = tmb_col
+  ),
+show_annotation_name = FALSE, 
+  simple_anno_size = unit(7, "mm")
+)
+
+
+lonco <- oncoPrint(
+  mat,
+  alter_fun = alter_fun,
+  col = col,
+  top_annotation = top_anno,
+  remove_empty_columns = TRUE,
+  remove_empty_rows = TRUE,
+  show_column_names = FALSE,
+  show_row_names = FALSE,
+  row_names_side = "left",
+  row_order = seq_len(nrow(mat)),
+  right_annotation = NULL,
+  
+  pct_side="right"
+)
+l<-draw(
+  lonco,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  merge_legends = TRUE
+)
+
+ht <- draw(lonco)
+
+dntitle <- plot_grid( ggdraw() +
+    draw_label("De Novo Metastatic", fontface = "bold", size = 12), grid.grabExpr(draw(dn)), ncol=1,rel_heights = c(.1,1)
+)
+
+etitle <- plot_grid( ggdraw() +
+    draw_label("Early Recurrent      ", fontface = "bold", size = 12), grid.grabExpr(draw(e)), ncol=1,rel_heights = c(.1,1)
+)
+
+ititle <- plot_grid( ggdraw() +
+    draw_label("Intermediate Recurrent   ", fontface = "bold", size = 12), grid.grabExpr(draw(i)), ncol=1,rel_heights = c(.1,1)
+)
+
+ltitle <- plot_grid( ggdraw() +
+    draw_label("Late Recurrent                           ", fontface = "bold", size = 12), grid.grabExpr(draw(l)), ncol=1,rel_heights = c(.1,1)
+)
+
+combonco<-plot_grid(
+dntitle,etitle,ititle,ltitle,
+  ncol = 4,rel_widths = c(1.3,1,1,1.5)
+)
+
+```
+
+#WGII figure and TMB analysis 
+```{r wgii as continuous variable}
+#wgii
+
+# modeling variable
+final$categories <- factor(
+  final$categories,
+  levels = c("De Novo Metastatic", "early", "intermediate", "late")
+)
+
+final$categories_model <- relevel(final$categories, ref = "late")
+
+# plotting order
+final$categories_plot <- factor(
+  final$categories_model,
+  levels = c("De Novo Metastatic","early","intermediate","late")
+)
+
+fit <- lm(wgii ~ categories_model + site, data = final)
+final$predwgiicat<-predict(fit,newdata = final)
+summary(fit)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+# Reduced model (no recurrence timing)
+fit_reduced <- lm(wgii ~ site, data = final)
+
+# Likelihood ratio test
+anova(fit_reduced, fit, test= "LRT")
+
+
+calipers <- data.frame(
+  group1 = c("late","late","late"),
+  group2 = c("De Novo Metastatic","early","intermediate"),
+  p = c(0.0017,0.012,0.092)
+) |>
+  filter(p < 0.05)
+
+
+
+calipers$y.position <- c(0.55,0.65)
+calipers$label <- sprintf("p = %.2g", calipers$p)
+
+
+wgiicat<-ggplot(final, aes(x = categories_plot, y = wgii)) +
+      geom_beeswarm(
+    aes(color = site),size = 1.5,alpha=0.7,method="center")+
+  geom_line(aes(y=predwgiicat,group=site,colour=site),linewidth = 1.2)+
+    geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.6) +
+
+    stat_pvalue_manual(
+        calipers,
+        label = "label",
+        tip.length = 0.01
+    ) +  
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"
+                 ))+
+    scale_x_discrete(
+        labels = c(
+            "De Novo Metastatic" = "DeNovo",
+            "early" = "Early",
+            "intermediate" = "Intermediate",
+            "late" = "Late"
+        )
+    ) +
+    labs(
+        x = NULL,
+        y = "WGII",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(0, 0.7)) +
+    theme_minimal()
+
+
+#continuous
+
+
+fit <- lm(wgii ~ timetotrial + site, data = final)
+summary(fit)
+confint(fit)
+
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+# Reduced model (no recurrence timing)
+fit_reduced <- lm(wgii ~ site, data = final[!is.na(final$timetotrial),])
+
+# Likelihood ratio test
+anova(fit_reduced, fit, test= "LRT")
+
+
+final$predwgii<-predict(fit,newdata = final)
+
+# final$partial_angio <- resid(fit) + coef(fit)["timetotrial"] * final$timetotrial
+
+p_label <- "p = 0.0096"
+
+summary(fit)
+
+
+final$timetotrialcut<-ifelse(final$timetotrial>120,120,final$timetotrial)
+
+wgiicont <- ggplot(final, aes(x = timetotrialcut, y = wgii,colour=site)) +
+    geom_point(alpha = 0.7) +geom_line(aes(x=timetotrial,y=predwgii),linewidth = 1.2) +
+    annotate("text",
+             x = 40,
+             y = 0.55,
+             label = p_label,
+             hjust = 0,
+             size = 4) +
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +  
+    scale_color_manual(
+        values = c(
+            "KIDNEY" = "#4d9221",
+            "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "WGII",
+        colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(0,.7), xlim = c(0,120)) +
+    theme_minimal()
+
+
+
+
+#### TMB
+#### TMB
+#### TMB
+#### TMB
+#### TMB
+
+#all analyses are done on log(TMB+1())
+final$logtmb <- log10(final$tmb + 1)
+
+fit <- lm(logtmb ~ categories_model + site, data = final)
+final$predtmbcat<-predict(fit,newdata = final)
+summary(fit)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+
+# Reduced model (no recurrence timing)
+fit_reduced <- lm(logtmb ~ site, data = final)
+
+# Likelihood ratio test
+anova(fit_reduced, fit, test= "LRT")
+
+
+
+calipers <- data.frame(
+  group1 = c("late","late","late"),
+  group2 = c("De Novo Metastatic","early","intermediate"),
+  p = c(0.35,0.24,0.21)
+) |>
+  filter(p < 0.05)
+
+
+calipers$label <- sprintf("p = %.2g", calipers$p)
+
+
+tmbcat<-ggplot(final, aes(x = categories_plot, y = logtmb)) +
+      geom_beeswarm(
+    aes(color = site),size = 1.5,alpha=0.7,method="center")+
+  geom_line(aes(y=predtmbcat,group=site,colour=site),linewidth = 1.2)+
+    geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.6) +
+
+
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"
+                 ))+
+    scale_x_discrete(
+        labels = c(
+            "De Novo Metastatic" = "DeNovo",
+            "early" = "Early",
+            "intermediate" = "Intermediate",
+            "late" = "Late"
+        )
+    ) +
+    labs(
+        x = NULL,
+        y = "TMB",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(0, 2.6)) +
+    theme_minimal()
+
+
+#continuous
+
+
+fit <- lm(logtmb ~ timetotrial + site, data = final)
+summary(fit)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+# Reduced model (no recurrence timing)
+fit_reduced <- lm(logtmb ~ site, data = final[!is.na(final$timetotrial),])
+
+# Likelihood ratio test
+anova(fit_reduced, fit, test= "LRT")
+
+
+final$predtmb<-predict(fit,newdata = final)
+
+# final$partial_angio <- resid(fit) + coef(fit)["timetotrial"] * final$timetotrial
+
+p_label <- "p = 0.54"
+
+summary(fit)
+
+tmbcont <- ggplot(final, aes(x = timetotrialcut, y = logtmb,colour=site)) +
+    geom_point(alpha = 0.7) +geom_line(aes(x=timetotrial,y=predtmb),linewidth = 1.2) +
+    annotate("text",
+             x = 40,
+             y = 0.55,
+             label = p_label,
+             hjust = 0,
+             size = 4) +
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +  
+    scale_color_manual(
+        values = c(
+            "KIDNEY" = "#4d9221",
+            "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "TMB",
+        colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(0,2.5), xlim = c(0,120)) +
+    theme_minimal()
+
+combtmb<-plot_grid(
+tmbcat,tmbcont,
+  ncol = 2,rel_widths = c(1.3,1)
+)
+
+combonco<-plot_grid(
+dntitle,etitle,ititle,ltitle,
+  ncol = 4,rel_widths = c(1.3,1,1,1.5)
+)
+
+combwgii<-plot_grid(
+wgiicat,wgiicont,
+  ncol = 2,rel_widths = c(1.3,1)
+)
+
+mutplot<-plot_grid(
+combonco,combwgii,combtmb,
+  ncol = 1,rel_heights = c(1.8,1,1)
+)
+
+mutplot_buffered <- mutplot +
+  theme(plot.margin = ggplot2::margin(t = 10, r = 0, b = 0, l = 10, unit = "mm"))
+  
+mutplot_buffered
+
+```
+
+## RNA analysis
+```{r RNA}
+
+
+natjavrna <- read_excel("/Users/smonda/Library/CloudStorage/OneDrive-MichiganMedicine/Research/M vs P/RDS121_2024_12_12T10_04_unzip/43018_2024_896_MOESM2_ESM(4).xlsx", 
+                        sheet = "Supp. Table 3")
+tpmjav<-data.frame(t(natjavrna))
+
+
+
+colnames(tpmjav) <- natjavrna$hgnc_symbol
+
+tpmjav<-tpmjav[-1,]
+
+tpmjav_num <- data.frame(
+  lapply(tpmjav, function(x) as.numeric(as.character(x))),
+  row.names = rownames(tpmjav),
+  check.names = FALSE
+)
+rm(tpmjav)
+rm(natjavrna)
+
+tpmjav_z <- as.data.frame(scale((tpmjav_num)))
+
+
+g15<-c("IGF2BP3","PTK6","BOLA3","UQCRH","TFCP2L1","SLC7A8","SLC16A1","PLIN5", "SLC7A1","TMEM81","RPL22L1","TCEB2","IQCC","TAGLN2","TMEM136")
+
+teff<-c("CD8A","IFNG","PRF1","EOMES","CD274")
+
+teff %in% colnames(tpmjav_z)
+
+cellcycle <- c("CDK2","CDK4","CDK6","BUB1","BUB1B","CCNE1",	"POLQ",	"AURKA",
+         "MKI67","CCNB2")
+
+cellcycle %in% colnames(tpmjav_z)
+
+stroma<-c("FAP","FN1","COL5A1","COL5A2","POSTN","COL1A1","COL1A2","MMP2")
+stroma %in% colnames(tpmjav_z)
+
+#PECAM1 not in JAV RNA data
+angio<-c("VEGFA","KDR","ESM1","PECAM1","ANGPTL4","CD34")
+
+angio %in% colnames(tpmjav_z)
+
+#CXCL8 not in JAV RNA data
+myeloid<-c("CXCL1","CXCL2","CXCL3","CXCL8","IL6","PTGS2")
+
+myeloid %in% colnames(tpmjav_z)
+
+vn<-c("APOLD1","EDNRB","NOS3","PPAP2B")
+#PPAP2B is synonymous with PLPP3
+ir<-c("CEACAM1","CX3CL1","CCL5")
+cgd<-c("EIF4EBP1","TUBB2A","LMNB1")
+il6<-c("IL6")
+#prolaris
+# ccp <- c("FOXM1","ASPM","TK1","PRC1","CDC20",
+#          "BUB1B",	"PBK",	"DTL",
+#          "CDKN3","RRM2","ASF1B","CEP55",
+#          "CDK1","DLGAP5","SKA1","RAD51",
+#          "KIF11","BIRC5","RAD54L","CENPM",
+#          "KIAA0101","KIF20A","PTTG1","CDCA8",
+#          "NUSAP1","PLK1","CDCA3","ORC6",
+#          "CENPF","TOP2A","MCM10")
+
+
+#1.5 μg/mL
+# 383.3 g/mol
+
+#udager vince salami
+emt<-c("LRRC15","GAS1","COL11A1","PTX3","COL7A1","COL8A2","LOXL2","SFRP4","PCOLCE","MXRA5","LOXL1","DKK1","CTHRC1","COL6A3","IL6","PRRX1","COL1A1","FBN2","SERPINE1","COMP","TFPI2","LUM")
+emt %in% colnames(tpmjav_z)
+# pam50prolif<-c("BIRC5", "CCNB1", "CDC20", "CDCA1", "CEP55", "KNTC2", "MKI67", "PTTG1", "RRM2", "TYMS", "UBE2C")
+
+tpmjav_z$angio <- rowMedians(
+  as.matrix(tpmjav_z[, colnames(tpmjav_z) %in% angio])
+)
+
+tpmjav_z$g15 <- rowSums(
+  as.matrix(tpmjav_z[, colnames(tpmjav_z) %in% g15])
+)
+
+
+tpmjav_z$teff <- rowMedians(
+  as.matrix(tpmjav_z[, colnames(tpmjav_z) %in% teff])
+)
+
+tpmjav_z$myeloid <- rowMedians(
+  as.matrix(tpmjav_z[, colnames(tpmjav_z) %in% myeloid])
+)
+
+
+tpmjav_z$stroma <- rowMedians(
+  as.matrix(tpmjav_z[, colnames(tpmjav_z) %in% stroma])
+)
+
+
+tpmjav_z$cellcycle <- rowMedians(
+  as.matrix(tpmjav_z[, colnames(tpmjav_z) %in% cellcycle])
+)
+
+
+tpmjav_z$emt <- rowSums(
+  as.matrix(tpmjav_z[, colnames(tpmjav_z) %in% emt])
+)
+
+
+final$angio<-tpmjav_z$angio[match(final$natid,rownames(tpmjav_z))]
+final$cellcycle<-tpmjav_z$cellcycle[match(final$natid,rownames(tpmjav_z))]
+final$teff<-tpmjav_z$teff[match(final$natid,rownames(tpmjav_z))]
+final$myeloid<-tpmjav_z$myeloid[match(final$natid,rownames(tpmjav_z))]
+final$stroma<-tpmjav_z$stroma[match(final$natid,rownames(tpmjav_z))]
+final$emt<-tpmjav_z$emt[match(final$natid,rownames(tpmjav_z))]
+final$g15<-tpmjav_z$g15[match(final$natid,rownames(tpmjav_z))]
+final$igf2bp3<-tpmjav_z$IGF2BP3[match(final$natid,rownames(tpmjav_z))]
+
+
+final$categories <- factor(final$categories)
+final$categories <- relevel(final$categories, ref = "late")
+
+
+
+#i would just focus on angio cell cycle tll myeloid teff, stroma is hard to interpret
+#angion
+#angio
+#angio
+
+
+fit <- lm(angio ~ categories_model + site, data = final)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+final$predangiocat<-predict(fit,newdata = final)
+summary(fit)
+# Reduced model (no recurrence timing)
+fit_reduced <- lm(angio ~ site, data = final)
+anova(fit_reduced, fit, test= "LRT")
+
+
+
+
+calipers <- data.frame(
+  group1 = c("late","late","late"),
+  group2 = c("De Novo Metastatic","early","intermediate"),
+  p = c(1.8e-06,3.3e-06,0.024)
+) |>
+  filter(p < 0.05)
+
+
+
+calipers$y.position <- c(2.1,2.5,2.9)
+calipers$label <- sprintf("p = %.2g", calipers$p)
+
+
+angiocat<-ggplot(final, aes(x = categories_plot, y = angio)) +
+      geom_beeswarm(
+    aes(color = site),size = 1.5,alpha=0.7,method="center")+
+  geom_line(aes(y=predangiocat,group=site,colour=site),linewidth = 1.2)+
+    geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.6) +
+
+    stat_pvalue_manual(
+        calipers,
+        label = "label",
+        tip.length = 0.01
+    ) +  
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"
+                 ))+
+    scale_x_discrete(
+        labels = c(
+            "De Novo Metastatic" = "DeNovo",
+            "early" = "Early",
+            "intermediate" = "Intermediate",
+            "late" = "Late"
+        )
+    ) +
+    labs(
+        x = NULL,
+        y = "Angiogenesis",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3, 3)) +
+    theme_minimal()
+
+
+
+
+
+fit <- lm(angio ~ timetotrial + site, data = final)
+# fit <- lm(emt ~ timetotrial + site, data = final)
+
+summary(fit)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+fit_reduced <- lm(angio ~ site, data = final[!is.na(final$timetotrial),])
+anova(fit_reduced, fit, test= "LRT")
+
+
+final$predangio<-predict(fit,newdata = final)
+
+# final$partial_angio <- resid(fit) + coef(fit)["timetotrial"] * final$timetotrial
+
+p_label <- "p = 0.00061"
+
+summary(fit)
+
+angiocont <- ggplot(final, aes(x = timetotrialcut, y = angio,colour=site)) +
+    geom_point(alpha = 0.7) +geom_line(aes(x=timetotrial,y=predangio),linewidth = 1.2) +
+    annotate("text",
+             x = 40,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +  
+    scale_color_manual(
+        values = c(
+            "KIDNEY" = "#4d9221",
+            "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Angiogenesis",
+        colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,120)) +
+    theme_minimal()
+
+###
+###cell cycle
+
+###
+###cell cycle
+
+###
+###cell cycle
+
+fit <- lm(cellcycle ~ categories_model + site, data = final)
+final$predcellcyclecat<-predict(fit,newdata = final)
+summary(fit)
+
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+fit_reduced <- lm(cellcycle ~ site, data = final)
+anova(fit_reduced, fit, test= "LRT")
+
+
+calipers <- data.frame(
+  group1 = c("late","late","late"),
+  group2 = c("De Novo Metastatic","early","intermediate"),
+  p = c(0.0019,0.0045,0.00015)
+) |>
+  filter(p < 0.05)
+
+
+
+calipers$y.position <- c(2.1,2.5,2.9)
+calipers$label <- sprintf("p = %.2g", calipers$p)
+
+
+cellcyclecat<-ggplot(final, aes(x = categories_plot, y = cellcycle)) +
+      geom_beeswarm(aes(color = site),size = 1.5,alpha=0.7,method="center") +
+    geom_line(aes(y=predcellcyclecat,group=site,colour=site),linewidth = 1.2)+
+  geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.6) +
+    stat_pvalue_manual(
+        calipers,
+        label = "label",
+        tip.length = 0.01
+    ) +
+    scale_x_discrete(
+        labels = c(
+            "De Novo Metastatic" = "DeNovo",
+            "early" = "Early",
+            "intermediate" = "Intermediate",
+            "late" = "Late"
+        )
+    ) +  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"
+                 ))+
+    labs(
+        x = NULL,
+        y = "Cell Cycle",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3, 3)) +
+    theme_minimal()
+
+
+
+
+fit <- lm(cellcycle ~ timetotrial + site, data = final)
+final$predcellcycle<-predict(fit,newdata = final)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+fit_reduced <- lm(cellcycle ~ site, data = final[!is.na(final$timetotrial),])
+anova(fit_reduced, fit, test= "LRT")
+
+summary(fit)
+
+
+
+p_label <- "p = 5.8e-06"
+
+
+cellcyclecont <- ggplot(final, aes(x = timetotrialcut, y = cellcycle,colour=site)) +
+    geom_point(alpha = 0.7) +
+  geom_line(aes(x=timetotrial,y=predcellcycle),linewidth = 1.2)+
+    annotate("text",
+             x = 40,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +  
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"        ))+
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Cell Cycle",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,120)) +
+    theme_minimal()
+
+###
+
+fit <- lm(cellcycle ~ categories_model + site, data = final)
+
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+fit_reduced <- lm(cellcycle ~ site, data = final)
+anova(fit_reduced, fit, test= "LRT")
+
+fit <- lm(cellcycle ~ timetotrial + site, data = final)
+fit_reduced <- lm(cellcycle ~ site, data = final[!is.na(final$timetotrial),])
+anova(fit_reduced, fit, test= "LRT")
+
+####
+
+fit <- lm(myeloid ~ categories_model + site, data = final)
+final$predmyeloidcat<-predict(fit,newdata = final)
+summary(fit)
+
+calipers <- data.frame(
+  group1 = c("late","late","late"),
+  group2 = c("De Novo Metastatic","early","intermediate"),
+  p = c(0.57,0.06,0.15)
+) |>
+  filter(p < 0.05)
+
+
+
+# calipers$y.position <- c(2.1,2.5,2.9)
+# calipers$label <- sprintf("p = %.2g", calipers$p)
+
+
+myeloidcat<-ggplot(final, aes(x = categories_plot, y = myeloid)) +
+      geom_beeswarm(aes(color = site),size = 1.5,alpha=0.7,method="center") +
+    geom_line(aes(y=predmyeloidcat,group=site,colour=site),linewidth = 1.2)+
+  geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.6) +
+    scale_x_discrete(
+        labels = c(
+            "De Novo Metastatic" = "DeNovo",
+            "early" = "Early",
+            "intermediate" = "Intermediate",
+            "late" = "Late"
+        )
+    ) +  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"
+                 ))+
+    labs(
+        x = NULL,
+        y = "Myeloid",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3, 3)) +
+    theme_minimal()
+
+myeloidcat
+
+
+fit <- lm(myeloid ~ timetotrial + site, data = final)
+final$predmyeloid<-predict(fit,newdata = final)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+fit_reduced <- lm(myeloid ~ site, data = final[!is.na(final$timetotrial),])
+anova(fit_reduced, fit, test= "LRT")
+
+summary(fit)
+
+
+
+ p_label <- "p = 0.0008"
+
+
+myeloidcont <- ggplot(final, aes(x = timetotrialcut, y = myeloid,colour=site)) +
+    geom_point(alpha = 0.7) +
+  geom_line(aes(x=timetotrial,y=predmyeloid),linewidth = 1.2)+
+    annotate("text",
+             x = 40,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"        ))+
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Myeloid",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,120)) +
+    theme_minimal()
+
+
+fit <- lm(myeloid ~ categories_model + site, data = final)
+fit_reduced <- lm(myeloid ~ site, data = final)
+anova(fit_reduced, fit, test= "LRT")
+
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+
+
+fit <- lm(myeloid ~ timetotrial + site, data = final)
+summary(fit)
+
+
+
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+fit_reduced <- lm(myeloid ~ site, data = final[!is.na(final$timetotrial),])
+anova(fit_reduced, fit, test= "LRT")
+
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+####
+
+fit <- lm(teff ~ categories_model + site, data = final)
+final$predteffcat<-predict(fit,newdata = final)
+summary(fit)
+
+calipers <- data.frame(
+  group1 = c("late","late","late"),
+  group2 = c("De Novo Metastatic","early","intermediate"),
+  p = c(0.55,0.24,0.36)
+) |>
+  filter(p < 0.05)
+
+
+
+# calipers$y.position <- c(2.1,2.5,2.9)
+# calipers$label <- sprintf("p = %.2g", calipers$p)
+# 
+
+teffcat<-ggplot(final, aes(x = categories_plot, y = teff)) +
+      geom_beeswarm(aes(color = site),size = 1.5,alpha=0.7,method="center") +
+    geom_line(aes(y=predteffcat,group=site,colour=site),linewidth = 1.2)+
+  geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.6) +
+    scale_x_discrete(
+        labels = c(
+            "De Novo Metastatic" = "DeNovo",
+            "early" = "Early",
+            "intermediate" = "Intermediate",
+            "late" = "Late"
+        )
+    ) +  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"
+                 ))+
+    labs(
+        x = NULL,
+        y = "T-effector",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3, 3)) +
+    theme_minimal()
+
+teffcat
+
+
+fit <- lm(teff ~ timetotrial + site, data = final)
+final$predteff<-predict(fit,newdata = final)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+fit_reduced <- lm(teff ~ site, data = final[!is.na(final$timetotrial),])
+anova(fit_reduced, fit, test= "LRT")
+
+summary(fit)
+
+
+
+# p_label <- "p = 1.4e-06"
+
+
+teffcont <- ggplot(final, aes(x = timetotrialcut, y = teff,colour=site)) +
+    geom_point(alpha = 0.7) +
+  geom_line(aes(x=timetotrial,y=predteff),linewidth = 1.2)+
+    # annotate("text",
+    #          x = 40,
+    #          y = 2.2,
+    #          # label = p_label,
+    #          hjust = 0,
+    #          size = 4) +  
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"        ))+
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +
+    labs(
+        x = "Recurrence Time (months)",
+        y = "T-effector",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,120)) +
+    theme_minimal()
+
+
+
+
+fit <- lm(teff ~ categories_model + site, data = final)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+fit_reduced <- lm(teff ~ site, data = final)
+anova(fit_reduced, fit, test= "LRT")
+
+fit <- lm(teff ~ timetotrial + site, data = final)
+
+cbind(
+  coef(fit),
+  confint(fit)
+)
+summary(fit)
+fit_reduced <- lm(teff ~ site, data = final[!is.na(final$timetotrial),])
+anova(fit_reduced, fit, test= "LRT")
+
+
+####
+
+fit <- lm(stroma ~ categories_model + site, data = final)
+final$predstromacat<-predict(fit,newdata = final)
+summary(fit)
+
+calipers <- data.frame(
+  group1 = c("late","late","late"),
+  group2 = c("De Novo Metastatic","early","intermediate"),
+  p = c(0.0028,0.00032,0.00003)
+) |>
+  filter(p < 0.05)
+
+
+
+calipers$y.position <- c(2.1,2.5,2.9)
+calipers$label <- sprintf("p = %.2g", calipers$p)
+
+
+stromacat<-ggplot(final, aes(x = categories_plot, y = stroma)) +
+      geom_beeswarm(aes(color = site),size = 1.5,alpha=0.7,method="center") +
+    geom_line(aes(y=predstromacat,group=site,colour=site),linewidth = 1.2)+
+  geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.6) +
+    stat_pvalue_manual(
+        calipers,
+        label = "label",
+        tip.length = 0.01
+    ) +
+    scale_x_discrete(
+        labels = c(
+            "De Novo Metastatic" = "DeNovo",
+            "early" = "Early",
+            "intermediate" = "Intermediate",
+            "late" = "Late"
+        )
+    ) +  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"
+                 ))+
+    labs(
+        x = NULL,
+        y = "Stroma",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3, 3)) +
+    theme_minimal()
+
+
+
+
+fit <- lm(stroma ~ timetotrial + site, data = final)
+final$predstroma<-predict(fit,newdata = final)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+fit_reduced <- lm(stroma ~ site, data = final[!is.na(final$timetotrial),])
+anova(fit_reduced, fit, test= "LRT")
+
+summary(fit)
+
+
+
+p_label <- "p = 1.4e-06"
+
+
+stromacont <- ggplot(final, aes(x = timetotrialcut, y = stroma,colour=site)) +
+    geom_point(alpha = 0.7) +
+  geom_line(aes(x=timetotrial,y=predstroma),linewidth = 1.2)+
+    annotate("text",
+             x = 40,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +  
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"        ))+
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Stroma",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,120)) +
+    theme_minimal()
+
+
+fit <- lm(stroma ~ categories_model + site, data = final)
+
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+fit_reduced <- lm(stroma ~ site, data = final)
+anova(fit_reduced, fit, test= "LRT")
+
+fit <- lm(stroma ~ timetotrial + site, data = final)
+summary(fit)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+fit_reduced <- lm(stroma ~ site, data = final[!is.na(final$timetotrial),])
+anova(fit_reduced, fit, test= "LRT")
+
+
+
+###
+###
+# ### EMT
+# 
+# fit <- lm(emt ~ categories_model + site, data = final)
+# summary(fit)
+# 
+# calipers <- data.frame(
+#   group1 = c("late","late","late"),
+#   group2 = c("De Novo Metastatic","early","intermediate"),
+#   p = c(0.000746,8.26e-05,0.000117)
+# ) |>
+#   filter(p < 0.05)
+# 
+# 
+# 
+# calipers$y.position <- c(9.1,9.5,9.9)
+# calipers$label <- sprintf("p = %.2g", calipers$p)
+# 
+# 
+# emtcat<-ggplot(final, aes(x = categories_plot, y = emt)) +
+#       geom_beeswarm(
+#     aes(color = site),size = 1.5,alpha=0.7,method="center") +
+#     geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.6) +
+# 
+#     stat_pvalue_manual(
+#         calipers,
+#         label = "label",
+#         tip.length = 0.01
+#     ) +  
+#   scale_color_manual(
+#                  values = c(
+#                      "KIDNEY" = "#4d9221",
+#                      "METASTASIS" = "#c51b7d"
+#                  ))+
+#     scale_x_discrete(
+#         labels = c(
+#             "De Novo Metastatic" = "DeNovo",
+#             "early" = "Early",
+#             "intermediate" = "Intermediate",
+#             "late" = "Late"
+#         )
+#     ) +
+#     labs(
+#         x = NULL,
+#         y = "Angiogenesis",
+#   colour = "Sequencing\nSite"
+#     ) +
+#     coord_cartesian(ylim = c(-10, 44)) +
+#     theme_minimal()
+# 
+# 
+# 
+# 
+# 
+# fit <- lm(emt ~ timetotrial + site, data = final)
+# 
+# final$partial_emt <- resid(fit) + coef(fit)["timetotrial"] * final$timetotrial
+# summary(fit)
+# 
+# p_label <- "p = 1.2e-6"
+# 
+# summary(fit)
+# 
+# emtcont <- ggplot(final, aes(x = timetotrialcut, y = emt,colour=site)) +
+#     geom_point(alpha = 0.7) +
+#     geom_smooth(method = "lm",   formula = y ~ x, se = TRUE, color = "black") +
+#     annotate("text",
+#              x = 40,
+#              y = 2.2,
+#              label = p_label,
+#              hjust = 0,
+#              size = 4) +
+#     scale_x_continuous(
+#         breaks = c(0,30,60,90,120),
+#         labels = c("0","30","60","90",">120")
+#     ) +  
+#   scale_color_manual(
+#                   values = c(
+#                       "KIDNEY" = "#4d9221",
+#                       "METASTASIS" = "#c51b7d"        ))+
+#     labs(
+#         x = "Recurrence Time (months)",
+#         y = "Angiogenesis",
+#   colour = "Sequencing\nSite"
+#     ) +
+#     coord_cartesian(ylim = c(-10,44), xlim = c(0,120)) +
+#     theme_minimal()
+# 
+# 
+# ###
+# ###TLS
+# ###
+# ###TLS###
+# ###TLS###
+# ###TLS###
+# ###TLS###
+# ###TLS
+# 
+# 
+# fit <- lm(tls ~ categories_model + site, data = final)
+# summary(fit)
+# 
+# calipers <- data.frame(
+#   group1 = c("late","late","late"),
+#   group2 = c("De Novo Metastatic","early","intermediate"),
+#   p = c(0.46,0.191,0.0355)
+# ) |>
+#   filter(p < 0.05)
+# 
+# 
+# 
+# calipers$y.position <- c(0.8)
+# calipers$label <- sprintf("p = %.2g", calipers$p)
+# 
+# 
+# tlscat<-ggplot(final, aes(x = categories_plot, y = tls)) +
+#       geom_beeswarm(aes(color = site),size = 1.5,alpha=0.7,method="center") +  
+#   geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.6) +  
+#   scale_color_manual(
+#                  values = c(
+#                      "KIDNEY" = "#4d9221",
+#                      "METASTASIS" = "#c51b7d"
+#                  ))+
+#     stat_pvalue_manual(
+#         calipers,
+#         label = "label",
+#         tip.length = 0.01
+#     ) +
+#     scale_x_discrete(
+#         labels = c(
+#             "De Novo Metastatic" = "DeNovo",
+#             "early" = "Early",
+#             "intermediate" = "Intermediate",
+#             "late" = "Late"
+#         )
+#     ) +
+#     labs(
+#         x = NULL,
+#         y = "TLS",
+#   colour = "Sequencing\nSite"
+#     ) +
+#     coord_cartesian(ylim = c(0, 1)) +
+#     theme_minimal()
+# 
+# 
+# 
+# 
+# 
+# fit <- lm(tls ~ timetotrial + site, data = final)
+# summary(fit)
+# final$partial_tls <- resid(fit) + coef(fit)["timetotrial"] * final$timetotrial
+# summary(fit)
+# p_label <- "p = 0.00014"
+# 
+# 
+# 
+# tlscont <- ggplot(final, aes(x = timetotrialcut, y = tls,colour=site)) +
+#     geom_point(alpha = 0.7) +
+#     geom_smooth(method = "lm",   formula = y ~ x, se = TRUE, color = "black") +
+#     annotate("text",
+#              x = 40,
+#              y = 0.8,
+#              label = p_label,
+#              hjust = 0,
+#              size = 4) +  scale_color_manual(
+#                  values = c(
+#                      "KIDNEY" = "#4d9221",
+#                      "METASTASIS" = "#c51b7d"
+#                  )
+#              ) +
+#     scale_x_continuous(
+#         breaks = c(0,30,60,90,120),
+#         labels = c("0","30","60","90",">120")
+#     ) +
+#     labs(
+#         x = "Recurrence Time (months)",
+#         y = "TLS",
+#   colour = "Sequencing\nSite"
+#     ) +
+#     coord_cartesian(ylim = c(0,1), xlim = c(0,120)) +
+#     theme_minimal()
+# 
+# 
+# tlscont <- ggplot(final, aes(x = timetotrialcut, y = partial_tls)) +
+#     geom_point(alpha = 0.7) +
+#     geom_smooth(method = "lm", se = FALSE, color = "#00274C") +
+#     annotate("text",
+#              x = 40,
+#              y = 0.8,
+#              label = p_label,
+#              hjust = 0,
+#              size = 4) +
+#     scale_x_continuous(
+#         breaks = c(0,30,60,90,120),
+#         labels = c("0","30","60","90",">120")
+#     ) +
+#     labs(
+#         x = "Recurrence Time (months)",
+#         y = "TLS"
+#     ) +
+#     coord_cartesian(ylim = c(0,1), xlim = c(0,120)) +
+#     theme_minimal()
+###
+###
+
+
+
+summary(lm(tls ~ categories + site, data = final))
+summary(lm(teff ~ categories + site, data = final))
+summary(lm(stroma ~ categories + site, data = final))
+summary(lm(myeloid ~ categories + site, data = final))
+summary(lm(cellcycle ~ categories + site, data = final))
+
+
+# 
+# final$igf2bp3<-tpmjav_z$IGF2BP3[match(final$natid,rownames(tpmjav_z))]
+# final$hif2a<-tpmjav_z$EPAS1[match(final$natid,rownames(tpmjav_z))]
+# final$hif1a<-tpmjav_z$HIF1A[match(final$natid,rownames(tpmjav_z))]
+# final$havcr1<-tpmjav_z$HAVCR1[match(final$natid,rownames(tpmjav_z))]
+
+# # final$pam50prolif<-tpmjav_z$pam50prolif[match(final$natid,rownames(tpmjav_z))]
+# final$ki67<-tpmjav_z$MKI67[match(final$natid,rownames(tpmjav_z))]
+# 
+#only final with expression data
+final$categories <- relevel(final$categories, ref = "late")
+
+finalexp<-subset(final,final$natid %in% rownames(tpmjav_z))
+
+
+design <- model.matrix(~ categories
+                       +site
+                       , data = finalexp)
+
+ftpm<-tpmjav_num[match(finalexp$natid,rownames(tpmjav_num)),]
+
+fit <- lmFit(t(ftpm), design)   # t() because limma expects genes x samples
+fit <- eBayes(fit)
+
+rank_dn <- sort(fit$t[, "categoriesDe Novo Metastatic"], decreasing = TRUE)
+rank_early <- sort(fit$t[, "categoriesearly"], decreasing = TRUE)
+rank_inter <- sort(fit$t[, "categoriesintermediate"], decreasing = TRUE)
+
+hallmark <- msigdbr(species = "Homo sapiens", category = "H")
+hallmark_list <- split(hallmark$gene_symbol, hallmark$gs_name)
+
+fg_dn <- fgsea(
+  pathways = hallmark_list,
+  stats = rank_dn, nperm = 100000
+)
+
+fg_early <- fgsea(
+  pathways = hallmark_list,
+  stats = rank_early, nperm = 100000
+)
+
+fg_inter <- fgsea(
+  pathways = hallmark_list,
+  stats = rank_inter, nperm = 100000
+)
+
+fg_dn_df <- as.data.frame(fg_dn)
+fg_early_df <- as.data.frame(fg_early)
+fg_inter_df <- as.data.frame(fg_inter)
+
+
+sig_dn   <- fg_dn_df$pathway[fg_dn_df$padj < 0.05]
+sig_early <- fg_early_df$pathway[fg_early_df$padj < 0.05]
+sig_inter <- fg_inter_df$pathway[fg_inter_df$padj < 0.05]
+
+pathways_keep <- Reduce(intersect, list(sig_dn, sig_early, sig_inter))
+pathways_keep_clean <- gsub("HALLMARK_", "", pathways_keep)
+
+nes_mat <- data.frame(
+  pathway = pathways_keep,
+  DeNovo = fg_dn$NES[match(pathways_keep, fg_dn$pathway)],
+  Early = fg_early$NES[match(pathways_keep, fg_early$pathway)],
+  Intermediate = fg_inter$NES[match(pathways_keep, fg_inter$pathway)]
+)
+
+
+nes_mat <- nes_mat[order(nes_mat$Early+nes_mat$DeNovo+nes_mat$Intermediate, decreasing = FALSE), ]
+
+nes_mat$Late <- 0
+
+nes_mat$pathway_clean <- gsub("HALLMARK_", "", nes_mat$pathway)
+
+nes_long <- melt(nes_mat, id.vars = c("pathway","pathway_clean"))
+
+nes_long$pathway_clean <- factor(
+  nes_long$pathway_clean,
+  levels = nes_mat$pathway_clean
+)
+
+nes_long$pathway <- factor(nes_long$pathway, levels = nes_mat$pathway)
+
+
+hallmarkheat <- ggplot(nes_long, aes(x = variable, y = pathway_clean, fill = value)) +
+  geom_tile() +
+  geom_text(
+    data = subset(nes_long, variable!= "Late"),
+    aes(label = "*"),
+    size = 5,
+    fontface = "bold",
+    vjust = 0.75   # nudges asterisk down to visually center it
+  ) +
+    geom_text(
+    data = subset(nes_long, variable== "Late"),
+    aes(label = "REF"),
+    size = 3,
+    vjust = 0.75   # nudges asterisk down to visually center it
+  ) +
+  scale_fill_gradient2(
+    low = "#2166ac", mid = "gray95", high = "#b2182b",
+    midpoint = 0, limits = c(-2.1, 4.3), name = "NES"
+  ) +
+  theme_minimal() +
+  scale_y_discrete(expand = expansion(mult = c(0.1, 0.0))) +
+  theme(plot.title.position = "plot",
+        plot.title = element_text(hjust = 0)) +
+  labs(x = "", y = "",
+       title = "Hallmark Pathway Enrichment Across Recurrence Groups-\nJAVELIN Renal 101 (n=599)")
+
+hallmarkheat
+
+
+####
+########
+####v
+####
+####
+####
+
+finalexp<-subset(final,final$natid %in% rownames(tpmjav_z))
+finalexp <- subset(finalexp, categories != "De Novo Metastatic")
+finalexp$timetotrial <- as.numeric(finalexp$timetotrial)
+
+design <- model.matrix(~ timetotrial+site
+                       
+                       , data = finalexp)
+
+ftpm<-tpmjav_num[match(finalexp$natid,rownames(tpmjav_z)),]
+
+fit_time <- lmFit(t(ftpm), design)
+fit_time <- eBayes(fit_time)
+
+
+rank_time <- fit_time$t[, "timetotrial"]
+names(rank_time) <- rownames(fit_time)
+
+rank_time <- sort(rank_time, decreasing = TRUE)
+
+
+
+fg_time <- fgsea(
+  pathways = hallmark_list,
+  stats = rank_time, nperm = 100000
+)
+
+fg_time_df <- as.data.frame(fg_time)
+
+ sig_time   <- fg_time_df$pathway[fg_time_df$padj < 0.05]
+
+fg_time_plot <- fg_time_df[match(pathways_keep, fg_time_df$pathway), ]
+
+fg_time_plot$order<-match(fg_time_plot$pathway,nes_mat$pathway)
+
+fg_time_plot$pathway_clean <- gsub("HALLMARK_", "", fg_time_plot$pathway)
+
+
+fg_time_plot$nesflip<-(-fg_time_plot$NES)
+
+hallmarkbar <- ggplot(fg_time_plot,
+                      aes(x = nesflip, y = reorder(pathway_clean, order), fill = nesflip)) +
+  geom_col() +
+    geom_text(
+    data = subset(fg_time_plot, padj < 0.05),
+    aes(label = "*",
+        hjust = ifelse(nesflip > 0, -0.3, 1.3)),
+    size = 6,
+    fontface = "bold"
+  ) +
+  scale_x_reverse() +
+  scale_y_discrete(expand = expansion(mult = c(0.1, 0.0))) +
+  scale_fill_gradient2(
+    low = "#2166ac",
+    mid = "gray95",
+    high = "#b2182b",
+    midpoint = 0,
+        limits = c(-2.1, 4.3),
+    name = "NES"
+  ) +
+  theme_minimal()  +
+    annotate(
+        "text",
+        x = 0,
+        y = 0,   # adjust depending on spacing
+        label = "← Enriched Earlier     Enriched Later →",
+        vjust = 1,  size = 3
+    )+
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(hjust = 0)
+  )+
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50")+
+  labs(
+    x = "",
+    y = "",
+    title = "Hallmark Pathway Enrichment Across Recurrence Time-\nJAVELIN Renal 101 (recurrent only; n=360)"
+  )+theme(legend.position = "none")
+
+
+hallmarkbar
+
+combined_heat <- plot_grid(
+  hallmarkheat,
+  hallmarkbar,
+  ncol = 2,
+  rel_widths = c(1.3, 1)
+)
+
+combined_heat
+
+```
+
+
+```{r S-TRAC validation}
+clinstrac <- read_delim("~/Downloads/15194361/A6181109.clinical.unified4_meta.tsv", 
+                   delim = "\t", escape_double = FALSE, 
+                   trim_ws = TRUE)
+
+clinmore <- read_delim("~/Downloads/15194361/A6181109_NC_figure_data_202207/Figure5-S2-S3_ElasticNet/A6181109/A6181109.20190807.clinicalv2_meta.tsv", 
+                       delim = "\t", escape_double = FALSE, 
+                       trim_ws = TRUE)
+TPMr <- read_delim("~/Downloads/15194361/A6181109.TPM.qc.map.median.log.tsv", 
+                   delim = "\t", escape_double = FALSE, 
+                   trim_ws = TRUE)
+
+rownames<-TPMr$HUGO
+TPMr<-TPMr[,colnames(TPMr)!="HUGO"]
+TPMr<-data.frame(TPMr)
+rownames(TPMr)<-rownames
+#log2tpm
+TPM<-data.frame(t(TPMr))
+TPMz<-data.frame(scale(TPM))
+rm(TPMr)
+
+clinmore$recur<-(clinmore$EVENTYP=="Disease Recurrence or occurrence of a Secondary Malignancy")
+clinmore$recurtime<-ifelse(clinmore$recur,
+                           ifelse(clinmore$EEVALUED<365,"early",
+                                  ifelse(clinmore$EEVALUED<1095,"mod","lateish")),NA
+                           )
+clinmore$id <- sub("^A6181109\\s+", "", clinmore$row_id)
+
+#subset to recurrences only
+clinmores<-clinmore[clinmore$EVENTYP=="Disease Recurrence or occurrence of a Secondary Malignancy"&!is.na(clinmore$EVENTYP),]
+
+
+TPMz$angio <- rowMedians(
+  as.matrix(TPMz[, colnames(TPMz) %in% angio])
+)
+
+
+TPMz$teff <- rowMedians(
+  as.matrix(TPMz[, colnames(TPMz) %in% teff])
+)
+
+TPMz$myeloid <- rowMedians(
+  as.matrix(TPMz[, colnames(TPMz) %in% myeloid])
+)
+
+
+TPMz$stroma <- rowMedians(
+  as.matrix(TPMz[, colnames(TPMz) %in% stroma])
+)
+
+
+TPMz$cellcycle <- rowMedians(
+  as.matrix(TPMz[, colnames(TPMz) %in% cellcycle])
+)
+
+
+TPMz$emt <- rowSums(
+  as.matrix(TPMz[, colnames(TPMz) %in% emt])
+)
+
+
+clinmores$angio<-TPMz$angio[match(clinmores$id,rownames(TPMz))]
+clinmores$cellcycle<-TPMz$cellcycle[match(clinmores$id,rownames(TPMz))]
+clinmores$teff<-TPMz$teff[match(clinmores$id,rownames(TPMz))]
+clinmores$myeloid<-TPMz$myeloid[match(clinmores$id,rownames(TPMz))]
+clinmores$stroma<-TPMz$stroma[match(clinmores$id,rownames(TPMz))]
+clinmores$emt<-TPMz$emt[match(clinmores$id,rownames(TPMz))]
+clinmores$time<-clinmores$EEVALUEM #months
+
+##angio figure
+fit <- lm(angio ~ time, data = clinmores)
+summary(fit)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+anova(fit, test= "LRT")
+
+
+p_label <- "p = 0.035"
+
+summary(fit)
+
+angiostraccont <- ggplot(clinmores, aes(x = time, y = angio)) +
+    geom_point(alpha = 0.7,colour="#4d9221") +
+    geom_smooth(method = "lm",   formula = y ~ x, se = FALSE, color = "#4d9221") +
+    annotate("text",
+             x = 20,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +
+    scale_x_continuous(
+        breaks = c(0,30,60),
+        labels = c("0","30","60")
+    ) +  
+  # scale_color_manual(
+  #                 values = c(
+  #                     "KIDNEY" = "#4d9221",
+  #                     "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Angiogenesis"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,75)) +
+    theme_minimal()
+
+##cellcycle figure
+fit <- lm(cellcycle ~ time, data = clinmores)
+summary(fit)
+
+anova(fit, test= "LRT")
+
+p_label <- "p = 0.063"
+
+summary(fit)
+
+##cellcycle
+cellcyclestraccont <- ggplot(clinmores, aes(x = time, y = cellcycle)) +
+    geom_point(alpha = 0.7,colour="#4d9221") +
+    geom_smooth(method = "lm",   formula = y ~ x, se = FALSE, color = "#4d9221") +
+    annotate("text",
+             x = 20,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +
+    scale_x_continuous(
+        breaks = c(0,30,60),
+        labels = c("0","30","60")
+    ) +  
+  # scale_color_manual(
+  #                 values = c(
+  #                     "KIDNEY" = "#4d9221",
+  #                     "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Cell Cycle"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,75)) +
+    theme_minimal()
+
+
+##cellcycle figure
+fit <- lm(stroma ~ time, data = clinmores)
+summary(fit)
+
+anova(fit, test= "LRT")
+
+p_label <- "p = 0.023"
+
+summary(fit)
+
+##stroma
+stromastraccont <- ggplot(clinmores, aes(x = time, y = stroma)) +
+    geom_point(alpha = 0.7,colour="#4d9221") +
+    geom_smooth(method = "lm",   formula = y ~ x, se = FALSE, color = "#4d9221") +
+    annotate("text",
+             x = 20,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +
+    scale_x_continuous(
+        breaks = c(0,30,60),
+        labels = c("0","30","60")
+    ) +  
+  # scale_color_manual(
+  #                 values = c(
+  #                     "KIDNEY" = "#4d9221",
+  #                     "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Stroma"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,75)) +
+    theme_minimal()
+
+
+##myeloid figure
+fit <- lm(myeloid ~ time, data = clinmores)
+summary(fit)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+anova(fit, test= "LRT")
+
+
+# p_label <- "p = 0.55"
+
+summary(fit)
+
+myeloidstraccont <- ggplot(clinmores, aes(x = time, y = myeloid)) +
+    geom_point(alpha = 0.7,colour="#4d9221") +
+    geom_smooth(method = "lm",   formula = y ~ x, se = FALSE, color = "#4d9221") +
+    # annotate("text",
+    #          x = 20,
+    #          y = 2.2,
+    #          label = p_label,
+    #          hjust = 0,
+    #          size = 4) +
+    scale_x_continuous(
+        breaks = c(0,30,60),
+        labels = c("0","30","60")
+    ) +  
+  # scale_color_manual(
+  #                 values = c(
+  #                     "KIDNEY" = "#4d9221",
+  #                     "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Myeloid"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,75)) +
+    theme_minimal()
+
+##teff figure
+fit <- lm(teff ~ time, data = clinmores)
+summary(fit)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+anova(fit, test= "LRT")
+
+
+# p_label <- "p = 0.55"
+
+summary(fit)
+
+teffstraccont <- ggplot(clinmores, aes(x = time, y = teff)) +
+    geom_point(alpha = 0.7,colour="#4d9221") +
+    geom_smooth(method = "lm",   formula = y ~ x, se = FALSE, color = "#4d9221") +
+    # annotate("text",
+    #          x = 20,
+    #          y = 2.2,
+    #          label = p_label,
+    #          hjust = 0,
+    #          size = 4) +
+    scale_x_continuous(
+        breaks = c(0,30,60),
+        labels = c("0","30","60")
+    ) +  
+  # scale_color_manual(
+  #                 values = c(
+  #                     "KIDNEY" = "#4d9221",
+  #                     "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Myeloid"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,75)) +
+    theme_minimal()
+
+
+
+#hallmarkpathway
+
+finalexp<-subset(clinmores,clinmores$id %in% rownames(TPM))
+finalexp$timetotrial <- as.numeric(finalexp$EEVALUEM)
+
+design <- model.matrix(~ timetotrial
+                       
+                       , data = finalexp)
+
+ftpm<-TPM[match(finalexp$id,rownames(TPM)),]
+
+
+fit_time <- lmFit(t(ftpm), design)
+fit_time <- eBayes(fit_time)
+
+
+rank_time <- fit_time$t[, "timetotrial"]
+names(rank_time) <- rownames(fit_time)
+
+rank_time <- sort(rank_time, decreasing = TRUE)
+
+
+fg_time <- fgsea(
+  pathways = hallmark_list,
+  stats = rank_time, nperm = 100000
+)
+
+fg_time_df <- as.data.frame(fg_time)
+
+sig_time   <- fg_time_df$pathway[fg_time_df$padj < 0.1]
+
+fg_time_plot <- fg_time_df[match(pathways_keep, fg_time_df$pathway), ]
+
+fg_time_plot$order<-match(fg_time_plot$pathway,nes_mat$pathway)
+
+fg_time_plot$pathway_clean <- gsub("HALLMARK_", "", fg_time_plot$pathway)
+
+
+fg_time_plot$nesflip<-(-fg_time_plot$NES)
+
+hallmarkbarstrac <- ggplot(fg_time_plot,
+                      aes(x = nesflip, y = reorder(pathway_clean, order), fill = nesflip)) +
+  geom_col() +
+  
+  geom_text(
+    data = subset(fg_time_plot, padj < 0.05),
+    aes(label = "*",
+        hjust = ifelse(nesflip > 0, -0.3, 1.3)),
+    size = 6,
+    fontface = "bold"
+  ) +
+  scale_x_reverse() +
+  scale_y_discrete(expand = expansion(mult = c(0.1, 0.0))) +
+  scale_fill_gradient2(
+    low = "#2166ac", mid = "gray95", high = "#b2182b",
+    midpoint = 0, limits = c(-2.1, 4.3), name = "NES"
+  ) +
+  theme_minimal() +
+  annotate("text", x = 0, y = 0,
+           label = "← Enriched Earlier     Enriched Later →",
+           vjust = 1, size = 3) +
+  theme(plot.title.position = "plot",
+        plot.title = element_text(hjust = 0),
+        legend.position = "none") +
+  labs(x = "", y = "",
+       title = "Hallmark Pathway Enrichment Across Recurrence Time-\nS-TRAC Recurrences (n=42)")
+
+
+hallmarkbarstrac
+
+
+
+
+
+
+```
+
+```{r IMmotion 010 validation}
+
+imm010clin <- read_excel("~/Library/CloudStorage/OneDrive-MichiganMedicine/Research/IMotion010/WO39210_ANON_IMmotion010.baseline.patient.data.778.20250513.xlsx")
+
+#remove M1NED patients
+imm010clinnephrec<-imm010clin[imm010clin$SCORE!="M1 NED",]
+
+imm010fmi <- read_excel("~/Library/CloudStorage/OneDrive-MichiganMedicine/Research/IMotion010/WO39210_ANON_IMmotion010.baseline.recurrence.FMI.data.160.20250304.xlsx")
+
+
+imm010clinrecur <- read_excel("~/Library/CloudStorage/OneDrive-MichiganMedicine/Research/IMotion010/WO39210_ANON_IMmotion010.baseline.recurrence.patient.data.160.20250513.xlsx")
+#eliminates redundant
+imm010clinrecur<-imm010clinrecur[imm010clinrecur$VISIT=="progression",]
+
+imm010clinrecur$score<-imm010clin$SCORE[match(imm010clinrecur$HASHED_PATID,imm010clin$HASHED_PATID)]
+
+imm010rnarecur <- read_excel("~/Library/CloudStorage/OneDrive-MichiganMedicine/Research/IMotion010/WO39210_ANON_IMmotion010.baseline.recurrence.rnaseq.160.20250304.xlsx")
+
+imm010clinrecur<-imm010clinrecur[imm010clinrecur$VISIT=="progression",]
+
+imm010clinrecur$score<-imm010clin$SCORE[match(imm010clinrecur$HASHED_PATID,imm010clin$HASHED_PATID)]
+
+
+imm010rna <- read_excel("~/Library/CloudStorage/OneDrive-MichiganMedicine/Research/IMotion010/WO39210_ANON_IMmotion010.baseline.rnaseq.754.20250304.xlsx")
+
+imm010rnarecur<-imm010rnarecur[,!colnames(imm010rnarecur) %in% colnames(imm010rna)]
+
+#again could consider removing this
+# CAN ONLY DO ONCE
+ imm010rna<-cbind(imm010rna,imm010rnarecur)
+
+#eliminating some unnamed genes (2500, could include for more granulatity)
+imm010rna<-imm010rna[,colnames(imm010rna)!="Unnamed: 0"]
+imm010rna<-imm010rna[!is.na(imm010rna$GENE_SYMBOL),]
+
+
+genes<-imm010rna$GENE_SYMBOL
+
+
+imm010trna<-as.data.frame(t(imm010rna))
+
+colnames(imm010trna)<-imm010rna$GENE_SYMBOL
+imm010trna<-imm010trna[rownames(imm010trna)!="GENE_SYMBOL",]
+imm010trna[] <- lapply(imm010trna, as.numeric)
+
+#removes non-nephrectomy patients
+# eliminate M1 NED patients you are focusing on nephrectomy recurrence
+#can scale before or after does not really matter, but for the sake of approach consistency did it after
+
+
+# imm010trna<-imm010trna[rownames(imm010trna) %in% imm010clinnephrec$HASHED_RNA_SAMPLE_ID,]
+
+
+imm010rnaz <- as.data.frame(scale(imm010trna))
+
+
+
+
+imm010rnaz$angio <- rowMedians(
+  as.matrix(imm010rnaz[, colnames(imm010rnaz) %in% angio])
+)
+
+
+imm010rnaz$teff <- rowMedians(
+  as.matrix(imm010rnaz[, colnames(imm010rnaz) %in% teff])
+)
+
+imm010rnaz$myeloid <- rowMedians(
+  as.matrix(imm010rnaz[, colnames(imm010rnaz) %in% myeloid])
+)
+
+
+imm010rnaz$g15 <- rowSums(
+  as.matrix(imm010rnaz[, colnames(imm010rnaz) %in% g15])
+)
+
+imm010rnaz$stroma <- rowMedians(
+  as.matrix(imm010rnaz[, colnames(imm010rnaz) %in% stroma])
+)
+
+imm010rnaz$cellcycle <- rowMedians(
+  as.matrix(imm010rnaz[, colnames(imm010rnaz) %in% cellcycle])
+)
+
+
+imm010rnaz$emt <- rowSums(
+  as.matrix(imm010rnaz[, colnames(imm010rnaz) %in% emt])
+)
+
+imm010rnaz$emtmed <- rowMedians(
+  as.matrix(imm010rnaz[, colnames(imm010rnaz) %in% emt])
+)
+
+imm010rnaz$g15 <- rowSums(
+  as.matrix(imm010rnaz[, colnames(imm010rnaz) %in% g15])
+)
+
+# imm010rnaz$hallmarkemt <- rowSums(
+#   as.matrix(imm010rnaz[, colnames(imm010rnaz) %in% hallmarkemt])
+# )
+
+# 
+# # Full table from the limma fit
+# res <- topTable(fit_time, coef = "timetotrial",
+#                 number = Inf, sort.by = "none")
+# res$gene <- rownames(res)
+# 
+# 
+# design <- model.matrix(~ timetotrial+site
+# 
+#                        , data = finalexp)
+# 
+# ftpm<-tpmjav_num[match(finalexp$natid,rownames(tpmjav_z)),]
+# fit_time <- lmFit(t(ftpm), design)
+# fit_time <- eBayes(fit_time)
+# rank_time <- fit_time$t[, "timetotrial"]
+# names(rank_time) <- rownames(fit_time)
+# 
+# # Full table from the limma fit
+# res <- topTable(fit_time, coef = "timetotrial",
+#                 number = Inf, sort.by = "none")
+# res$gene <- rownames(res)
+# 
+# 
+# # Top 25 genes upregulated in EARLY recurrence (most negative t)
+# early_genes <- res[order(res$t), ][1:100, ]
+# 
+# # Top 25 genes upregulated in LATE recurrence (most positive t)
+# late_genes <- res[order(-res$t), ][1:100, ]
+# 
+# early_genes[, c("gene","logFC","t","P.Value","adj.P.Val")]
+# late_genes[,  c("gene","logFC","t","P.Value","adj.P.Val")]
+# 
+# 
+# # imm010rnaz$tengenes <- rowSums(
+# #   as.matrix(imm010rnaz[, colnames(imm010rnaz) %in% tengenes])
+# # )
+# late_mat <- as.matrix(imm010rnaz[, colnames(imm010rnaz) %in% rownames(late_genes)])
+# late_score <- rowMeans(late_mat, na.rm = TRUE)
+# 
+# imm010rnaz$tengenes <-
+#   rowMeans(
+#   as.matrix(imm010rnaz[, colnames(imm010rnaz) %in% rownames(early_genes)])
+# )-
+# late_score
+# # 
+# # imm010clin$tengenes<-imm010rnaz$tengenes[match(imm010clin$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+# # 
+# imm010clins<-imm010clin[imm010clin$SCORE!="M1 NED",]
+# imm010clins$high<-imm010clins$emt>median(as.numeric(imm010clins$emt), na.rm = TRUE)
+# imm010clins$highs<-imm010clins$emtmed>median(as.numeric(imm010clins$emtmed), na.rm = TRUE)
+# 
+# 
+# 
+# 
+# # # imm010clins<-imm010clin
+# 
+# 
+ # imm010clins<-subset(imm010clin,imm010clin$KIM1_C1D1>200)
+
+# ggsurvplot(survfit(Surv(DFS_MONTHS,DFS_CENSOR)~
+#                        TREATMENT_ARM
+#                    ,
+#                    data=imm010clins)
+#            ,risk.table = TRUE,cumevents  =TRUE)
+
+
+imm010clin$angio<-imm010rnaz$angio[match(imm010clin$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+imm010clin$cellcycle<-imm010rnaz$cellcycle[match(imm010clin$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+imm010clin$teff<-imm010rnaz$teff[match(imm010clin$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+imm010clin$myeloid<-imm010rnaz$myeloid[match(imm010clin$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+imm010clin$stroma<-imm010rnaz$stroma[match(imm010clin$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+imm010clin$emt<-imm010rnaz$emt[match(imm010clin$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+imm010clin$tengenes<-imm010rnaz$tengenes[match(imm010clin$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+imm010clin$g15<-imm010rnaz$g15[match(imm010clin$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+# imm010clin$hallmarkemt<-imm010rnaz$hallmarkemt[match(imm010clin$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+imm010clin$emtmed<-imm010rnaz$emtmed[match(imm010clin$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+
+imm010clinrecur$angio<-imm010rnaz$angio[match(imm010clinrecur$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+imm010clinrecur$cellcycle<-imm010rnaz$cellcycle[match(imm010clinrecur$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+imm010clinrecur$teff<-imm010rnaz$teff[match(imm010clinrecur$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+imm010clinrecur$myeloid<-imm010rnaz$myeloid[match(imm010clinrecur$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+imm010clinrecur$stroma<-imm010rnaz$stroma[match(imm010clinrecur$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+imm010clinrecur$emt<-imm010rnaz$emt[match(imm010clinrecur$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+# imm010clinrecur$tengenes<-imm010rnaz$tengenes[match(imm010clinrecur$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+imm010clinrecur$g15<-imm010rnaz$g15[match(imm010clinrecur$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+# imm010clin$hallmarkemt<-imm010rnaz$hallmarkemt[match(imm010clin$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+imm010clinrecur$emtmed<-imm010rnaz$emtmed[match(imm010clinrecur$HASHED_RNA_SAMPLE_ID,rownames(imm010rnaz))]
+
+imm010clinrecur$time<-imm010clinrecur$DFS_MONTHS
+
+imm010clin$angiorecur<-imm010clinrecur$angio[match(imm010clin$HASHED_PATID,imm010clinrecur$HASHED_PATID)]
+
+imm010clin$nmfrecur<-imm010clinrecur$NMF_SUBTYPE[match(imm010clin$HASHED_PATID,imm010clinrecur$HASHED_PATID)]
+
+imm010clin$time<-imm010clin$DFS_MONTHS
+
+
+
+
+
+# ggplot(imm010clinrecurnephec, aes(x = time, y = emt,colour= TREATMENT_ARM)) +
+#     geom_point(alpha = 0.7) 
+
+# imm010clinrecurnephrecprim<-imm010clin[match(imm010clinrecurnephec$HASHED_PATID,imm010clin$HASHED_PATID),]
+
+#non M1NED patients that recur on placebo
+
+imm010clin$categories_plot<-ifelse(imm010clin$time<12,"early","intermediate")
+
+imm010placeborec<-imm010clin[imm010clin$SCORE!="M1 NED" &imm010clin$TREATMENT_ARM=="PLACEBO" & imm010clin$DFS_CENSOR == TRUE,]
+
+imm010atezorec<-imm010clin[imm010clin$SCORE!="M1 NED" &imm010clin$TREATMENT_ARM!="PLACEBO" & imm010clin$DFS_CENSOR == TRUE,]
+
+imm010rec<-imm010clin[imm010clin$SCORE!="M1 NED" & imm010clin$DFS_CENSOR == TRUE,]
+
+#this is recurrence sequencing
+# imm010clinrecurnephrec<-imm010clinrecur[imm010clinrecur$score!="M1 NED",]
+# 
+# imm010clinrecurnephrec$angioprim<-imm010clin$angio[match(imm010clinrecurnephrec$HASHED_PATID,imm010clin$HASHED_PATID)]
+# imm010clinrecurnephrec$NMF_SUBTYPE<-imm010clin$NMF_SUBTYPE[match(imm010clinrecurnephrec$HASHED_PATID,imm010clin$HASHED_PATID)]
+
+
+##angio figure
+fit <- lm(angio ~ time, data = imm010placeborec)
+summary(fit)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+anova(fit, test= "LRT")
+
+
+p_label <- "p = 0.0014"
+
+summary(fit)
+
+angioimm010cont <- ggplot(imm010placeborec, aes(x = time, y = angio)) +
+    geom_point(alpha = 0.7,colour="#4d9221") +
+    geom_smooth(method = "lm",   formula = y ~ x, se = FALSE, color = "#4d9221") +
+    annotate("text",
+             x = 20,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +
+    scale_x_continuous(
+        breaks = c(0,30,60),
+        labels = c("0","30","60")
+    ) +  
+  # scale_color_manual(
+  #                 values = c(
+  #                     "KIDNEY" = "#4d9221",
+  #                     "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Angiogenesis"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,60)) +
+    theme_minimal()
+
+##cellcycle figure
+fit <- lm(cellcycle ~ time, data = imm010placeborec)
+summary(fit)
+
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+anova(fit, test= "LRT")
+
+p_label <- "p = 0.0045"
+
+summary(fit)
+
+##cellcycle
+cellcycleimm010cont <- ggplot(imm010placeborec, aes(x = time, y = cellcycle)) +
+    geom_point(alpha = 0.7,colour="#4d9221") +
+    geom_smooth(method = "lm",   formula = y ~ x, se = FALSE, color = "#4d9221") +
+    annotate("text",
+             x = 20,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +
+    scale_x_continuous(
+        breaks = c(0,30,60),
+        labels = c("0","30","60")
+    ) +  
+  # scale_color_manual(
+  #                 values = c(
+  #                     "KIDNEY" = "#4d9221",
+  #                     "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Cell Cycle"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,60)) +
+    theme_minimal()
+
+
+##stroma figure
+fit <- lm(stroma ~ time, data = imm010placeborec)
+
+
+summary(fit)
+
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+
+anova(fit, test= "LRT")
+
+p_label <- "p = 0.0049"
+
+summary(fit)
+
+##stroma
+stromasimm010cont <- ggplot(imm010placeborec, aes(x = time, y = stroma)) +
+    geom_point(alpha = 0.7,colour="#4d9221") +
+    geom_smooth(method = "lm",   formula = y ~ x, se = FALSE, color = "#4d9221") +
+    annotate("text",
+             x = 20,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +
+    scale_x_continuous(
+        breaks = c(0,30,60),
+        labels = c("0","30","60")
+    ) +  
+  # scale_color_manual(
+  #                 values = c(
+  #                     "KIDNEY" = "#4d9221",
+  #                     "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Stroma"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,60)) +
+    theme_minimal()
+
+
+##myeloid figure
+fit <- lm(myeloid ~ time, data = imm010placeborec)
+summary(fit)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+anova(fit, test= "LRT")
+
+
+ p_label <- "p = 0.037"
+
+summary(fit)
+
+myeloidimm010cont <- ggplot(imm010placeborec, aes(x = time, y = myeloid)) +
+    geom_point(alpha = 0.7,colour="#4d9221") +
+    geom_smooth(method = "lm",   formula = y ~ x, se = FALSE, color = "#4d9221") +
+      annotate("text",
+             x = 20,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +
+    # annotate("text",
+    #          x = 20,
+    #          y = 2.2,
+    #          label = p_label,
+    #          hjust = 0,
+    #          size = 4) +
+    scale_x_continuous(
+        breaks = c(0,30,60),
+        labels = c("0","30","60")
+    ) +  
+  # scale_color_manual(
+  #                 values = c(
+  #                     "KIDNEY" = "#4d9221",
+  #                     "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Myeloid"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,60)) +
+    theme_minimal()
+
+##teff figure
+fit <- lm(teff ~ time, data = imm010placeborec)
+summary(fit)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+anova(fit, test= "LRT")
+
+
+# p_label <- "p = 0.55"
+
+summary(fit)
+
+teffimm010cont <- ggplot(imm010placeborec, aes(x = time, y = teff)) +
+    geom_point(alpha = 0.7,colour="#4d9221") +
+    geom_smooth(method = "lm",   formula = y ~ x, se = FALSE, color = "#4d9221") +
+    # annotate("text",
+    #          x = 20,
+    #          y = 2.2,
+    #          label = p_label,
+    #          hjust = 0,
+    #          size = 4) +
+    scale_x_continuous(
+        breaks = c(0,30,60),
+        labels = c("0","30","60")
+    ) +  
+  # scale_color_manual(
+  #                 values = c(
+  #                     "KIDNEY" = "#4d9221",
+  #                     "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "T-Effector"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,60)) +
+    theme_minimal()
+
+
+
+#hallmarkpathway
+
+finalexp<-subset(imm010placeborec,imm010placeborec$HASHED_RNA_SAMPLE_ID %in% rownames(imm010trna))
+
+# finalexp<-subset(imm010rec,imm010rec$HASHED_RNA_SAMPLE_ID %in% rownames(imm010trna))
+
+
+# finalexp<-subset(imm010atezorec,imm010atezorec$HASHED_RNA_SAMPLE_ID %in% rownames(imm010trna))
+
+# finalexp<-subset(imm010rec,imm010rec$HASHED_RNA_SAMPLE_ID %in% rownames(imm010trna))
+
+
+finalexp$timetotrial <- as.numeric(finalexp$DFS_MONTHS)
+
+# design <- model.matrix(~ TREATMENT_ARM
+# 
+#                        , data = finalexp)
+
+design <- model.matrix(~ timetotrial
+                       
+                       , data = finalexp)
+
+ftpm<-imm010trna[match(finalexp$HASHED_RNA_SAMPLE_ID,rownames(imm010trna)),]
+
+
+fit_time <- lmFit(t(ftpm), design)
+fit_time <- eBayes(fit_time)
+
+
+rank_time <- fit_time$t[, "timetotrial"]
+
+
+# rank_time <- fit_time$t[, "TREATMENT_ARMPLACEBO"]
+
+names(rank_time) <- rownames(fit_time)
+
+rank_time <- sort(rank_time, decreasing = TRUE)
+
+
+rank_time <- rank_time[!is.na(rank_time)]
+rank_time <- rank_time[order(-abs(rank_time))]
+rank_time <- rank_time[!duplicated(names(rank_time))]
+rank_time <- sort(rank_time, decreasing = TRUE)
+
+fg_time <- fgsea(
+  pathways = hallmark_list,
+  stats = rank_time, nperm = 100000
+)
+
+
+
+fg_time_df <- as.data.frame(fg_time)
+
+sig_time   <- fg_time_df$pathway[fg_time_df$padj < 0.1]
+
+fg_time_plot <- fg_time_df[match(pathways_keep, fg_time_df$pathway), ]
+
+fg_time_plot$order<-match(fg_time_plot$pathway,nes_mat$pathway)
+
+fg_time_plot$pathway_clean <- gsub("HALLMARK_", "", fg_time_plot$pathway)
+
+
+fg_time_plot$nesflip<-(-fg_time_plot$NES)
+
+hallmarkbarimm010 <- ggplot(fg_time_plot,
+                      aes(x = nesflip, y = reorder(pathway_clean, order), fill = nesflip)) +
+  geom_col() +  
+  
+  scale_x_reverse() +
+  scale_y_discrete(expand = expansion(mult = c(0.1, 0.0))) +
+  scale_fill_gradient2(
+    low = "#2166ac",
+    mid = "gray95",
+    high = "#b2182b",
+    midpoint = 0,
+      limits = c(-2.1, 4.3),
+    name = "NES"
+  )  +
+  theme_minimal()  +
+    annotate(
+        "text",
+        x = 0,
+        y = 0,   # adjust depending on spacing
+        label = "← Enriched Earlier     Enriched Later →",
+        vjust = 1,  size = 3
+    ) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(hjust = 0)
+  )+
+  labs(
+    x = "",
+    y = "",
+    title = "Hallmark Pathway Enrichment Across Recurrence Time-\nIMmotion 010 Recurrences (placebo only; n=88)"
+  )+theme(legend.position = "none")
+
+
+hallmarkbarimm010
+hallmarkbarimm010 <- ggplot(fg_time_plot,
+                      aes(x = nesflip, y = reorder(pathway_clean, order), fill = nesflip)) +
+  geom_col() +
+  geom_text(
+    data = subset(fg_time_plot, padj < 0.05),
+    aes(label = "*",
+        hjust = ifelse(nesflip > 0, -0.3, 1.3)),
+    size = 6,
+    fontface = "bold"
+  ) +
+  scale_x_reverse() +
+  scale_y_discrete(expand = expansion(mult = c(0.1, 0.0))) +
+  scale_fill_gradient2(
+    low = "#2166ac", mid = "gray95", high = "#b2182b",
+    midpoint = 0, limits = c(-2.1, 4.3), name = "NES"
+  ) +
+  theme_minimal() +
+  annotate("text", x = 0, y = 0,
+           label = "← Enriched Earlier     Enriched Later →",
+           vjust = 1, size = 3) +
+  theme(plot.title.position = "plot",
+        plot.title = element_text(hjust = 0),
+        legend.position = "none") +
+  labs(x = "", y = "",
+       title = "Hallmark Pathway Enrichment Across Recurrence Time-\nIMmotion 010 Recurrences (placebo only; n=88)")
+
+
+
+combined_all<-plot_grid(
+    hallmarkheat,
+    hallmarkbar,angiocat,angiocont,cellcyclecat,cellcyclecont,
+    ncol = 2,
+    rel_widths = c(1.3, 1),rel_heights = c(2,1,1)
+)
+
+combined_allstrac<-plot_grid(
+    hallmarkbarstrac,angiostraccont,cellcyclestraccont,
+    ncol =1,rel_heights = c(2,1,1)
+)
+
+combinedjavstract<-plot_grid(
+    hallmarkheat,
+    hallmarkbar,hallmarkbarstrac,
+    angiocat,angiocont,angiostraccont,cellcyclecat,cellcyclecont,cellcyclestraccont,
+    ncol = 3,
+    rel_widths = c(1, 1,1),rel_heights = c(1,0.6,0.6)
+)
+
+# combinedjavstracimm010<-plot_grid(
+#     hallmarkheat,
+#     hallmarkbar,hallmarkbarstrac,hallmarkbarimm010,
+#     angiocat,angiocont,angiostraccont,angioimm010cont,
+#     cellcyclecat,cellcyclecont,cellcyclestraccont,cellcycleimm010cont,
+#     stromacat,stromacont,stromastraccont,stromasimm010cont,
+#     ncol = 4,
+#     rel_widths = c(1, 1,0.8,0.75),rel_heights = c(1,0.6,0.6)
+# )
+
+combinedjavstracimm010<-plot_grid(
+    hallmarkheat,
+    hallmarkbar,hallmarkbarstrac,hallmarkbarimm010,
+    angiocat,angiocont,angiostraccont,angioimm010cont,
+    cellcyclecat,cellcyclecont,cellcyclestraccont,cellcycleimm010cont,
+    ncol = 4,
+    rel_widths = c(1, 1,1,1),rel_heights = c(1,0.5,0.5)
+)
+combinedjavstracimm010
+
+combinedjavstracimm010_buffered <- combinedjavstracimm010 +
+  theme(plot.margin = ggplot2::margin(t = 10, r = 0, b = 0, l = 10, unit = "mm"))
+
+
+combinedjavstract
+combined_all
+
+combinedstroma<-plot_grid(
+stromacat,stromacont,stromastraccont,stromasimm010cont,
+    ncol = 4,
+    rel_widths = c(1, 1,1,1)
+)
+
+combinedteff<-plot_grid(
+teffcat,teffcont,teffstraccont,teffimm010cont,
+    ncol = 4,
+    rel_widths = c(1, 1,1,1)
+)
+
+
+combinedmyeloid<-plot_grid(
+myeloidcat,myeloidcont,myeloidstraccont,myeloidimm010cont,
+    ncol = 4,
+    rel_widths = c(1, 1,1,1)
+)
+
+
+```
+#stratified analyses- metastasis sequencing only, primary tumor sequencing only
+#and on co-author suggestion exclusion of sarcomatoid, and stratified to no sarcomatoid, and high grade (1/2) and low grade (3/4)
+
+```{r sensitivity analysis to ensure significance is retained for only primary and only met site sequencing, applied on continuous analyses (early vs late, DEG)}
+
+#metastasis only
+finalexp<-subset(final,final$natid %in% rownames(tpmjav_z))
+finalexp <- subset(finalexp, categories != "De Novo Metastatic")
+finalexp<-subset(finalexp, site == "METASTASIS")
+finalexp$timetotrial <- as.numeric(finalexp$timetotrial)
+
+
+fit <- lm(wgii ~ timetotrial, data = finalexp)
+finalexp$predwgii<-predict(fit,newdata = finalexp)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+anova(fit, test= "LRT")
+
+summary(fit)
+
+
+
+p_label <- "p = 0.061"
+
+
+wgiimetonly <- ggplot(finalexp, aes(x = timetotrialcut, y = wgii,colour=site)) +
+    geom_point(alpha = 0.7) +
+  geom_line(aes(x=timetotrial,y=predwgii),linewidth = 1.2)+
+    annotate("text",
+             x = 40,
+             y = 0.5,
+             label = p_label,
+             hjust = 0,
+             size = 4) +  
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"        ))+
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +
+    labs(
+        x = "Recurrence Time (months)",
+        y = "WGII",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(0,0.7), xlim = c(0,120)) +
+    theme_minimal()
+
+
+fit <- lm(cellcycle ~ timetotrial, data = finalexp)
+finalexp$predcellcycle<-predict(fit,newdata = finalexp)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+anova(fit, test= "LRT")
+
+summary(fit)
+
+
+
+p_label <- "p = 5e-5"
+
+
+cellcyclemetonly <- ggplot(finalexp, aes(x = timetotrialcut, y = cellcycle,colour=site)) +
+    geom_point(alpha = 0.7) +
+  geom_line(aes(x=timetotrial,y=predcellcycle),linewidth = 1.2)+
+    annotate("text",
+             x = 40,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +  
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"        ))+
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Cell Cycle",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,120)) +
+    theme_minimal()
+
+
+
+fit <- lm(angio ~ timetotrial, data = finalexp)
+finalexp$predangio<-predict(fit,newdata = finalexp)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+anova(fit, test= "LRT")
+
+summary(fit)
+
+
+
+p_label <- "p = 0.16"
+
+
+angiometonly <- ggplot(finalexp, aes(x = timetotrialcut, y = angio,colour=site)) +
+    geom_point(alpha = 0.7) +
+  geom_line(aes(x=timetotrial,y=predangio),linewidth = 1.2)+
+    annotate("text",
+             x = 40,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +  
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"        ))+
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Angio",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,120)) +
+    theme_minimal()
+
+
+fit <- lm(stroma ~ timetotrial, data = finalexp)
+finalexp$predstroma<-predict(fit,newdata = finalexp)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+anova(fit, test= "LRT")
+
+summary(fit)
+
+
+
+p_label <- "p = 0.00013"
+
+
+stromametonly <- ggplot(finalexp, aes(x = timetotrialcut, y = stroma,colour=site)) +
+    geom_point(alpha = 0.7) +
+  geom_line(aes(x=timetotrial,y=predstroma),linewidth = 1.2)+
+    annotate("text",
+             x = 40,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +  
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"        ))+
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Stroma",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,120)) +
+    theme_minimal()
+
+
+#hallmark
+
+design <- model.matrix(~ timetotrial
+                       
+                       , data = finalexp)
+
+ftpm<-tpmjav_num[match(finalexp$natid,rownames(tpmjav_z)),]
+
+
+fit_time <- lmFit(t(ftpm), design)
+fit_time <- eBayes(fit_time)
+
+
+rank_time <- fit_time$t[, "timetotrial"]
+names(rank_time) <- rownames(fit_time)
+
+rank_time <- sort(rank_time, decreasing = TRUE)
+
+
+fg_time <- fgsea(
+  pathways = hallmark_list,
+  stats = rank_time, nperm = 100000
+)
+
+fg_time_df <- as.data.frame(fg_time)
+
+ sig_time   <- fg_time_df$pathway[fg_time_df$padj < 0.05]
+
+fg_time_plot <- fg_time_df[match(pathways_keep, fg_time_df$pathway), ]
+
+fg_time_plot$order<-match(fg_time_plot$pathway,nes_mat$pathway)
+
+fg_time_plot$pathway_clean <- gsub("HALLMARK_", "", fg_time_plot$pathway)
+
+
+fg_time_plot$nesflip<-(-fg_time_plot$NES)
+
+hallmarkbarmetonly <- ggplot(fg_time_plot,
+                      aes(x = nesflip, y = reorder(pathway_clean, order), fill = nesflip)) +
+  geom_col() +
+      geom_text(
+    data = subset(fg_time_plot, padj < 0.05),
+    aes(label = "*",
+        hjust = ifelse(nesflip > 0, -0.3, 1.3)),
+    size = 6,
+    fontface = "bold"
+  ) +
+  scale_x_reverse() +
+  scale_y_discrete(expand = expansion(mult = c(0.1, 0.0))) +
+  scale_fill_gradient2(
+    low = "#2166ac",
+    mid = "gray95",
+    high = "#b2182b",
+    midpoint = 0,
+        limits = c(-2.3, 4.3),
+    name = "NES"
+  ) +
+  theme_minimal()  +
+    annotate(
+        "text",
+        x = 0,
+        y = 0,   # adjust depending on spacing
+        label = "← Enriched Earlier     Enriched Later →",
+        vjust = 1,  size = 3
+    )+
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(hjust = 0)
+  )+
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50")+
+  labs(
+    x = "",
+    y = "",
+    title = "Hallmark Pathway Enrichment Across Recurrence Time-\nJAVELIN Renal 101- Metastatic Site Sequencing Only"
+  )+theme(legend.position = "none")
+
+
+#primary only
+#primary only
+#primary only
+#primary only
+#primary only
+#primary only
+#primary only
+finalexp<-subset(final,final$natid %in% rownames(tpmjav_z))
+finalexp <- subset(finalexp, categories != "De Novo Metastatic")
+finalexp<-subset(finalexp, site != "METASTASIS")
+finalexp$timetotrial <- as.numeric(finalexp$timetotrial)
+
+
+fit <- lm(wgii ~ timetotrial, data = finalexp)
+finalexp$predwgii<-predict(fit,newdata = finalexp)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+anova(fit, test= "LRT")
+
+summary(fit)
+
+
+
+p_label <- "p = 0.043"
+
+
+wgiiprimonly <- ggplot(finalexp, aes(x = timetotrialcut, y = wgii,colour=site)) +
+    geom_point(alpha = 0.7) +
+  geom_line(aes(x=timetotrial,y=predwgii),linewidth = 1.2)+
+    annotate("text",
+             x = 40,
+             y = 0.5,
+             label = p_label,
+             hjust = 0,
+             size = 4) +  
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"        ))+
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +
+    labs(
+        x = "Recurrence Time (months)",
+        y = "WGII",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(0,0.7), xlim = c(0,120)) +
+    theme_minimal()
+
+wgiiprimonly
+
+
+
+fit <- lm(cellcycle ~ timetotrial, data = finalexp)
+finalexp$predcellcycle<-predict(fit,newdata = finalexp)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+anova(fit, test= "LRT")
+
+summary(fit)
+
+
+
+p_label <- "p = 0.045"
+
+
+cellcycleprimonly <- ggplot(finalexp, aes(x = timetotrialcut, y = cellcycle,colour=site)) +
+    geom_point(alpha = 0.7) +
+  geom_line(aes(x=timetotrial,y=predcellcycle),linewidth = 1.2)+
+    annotate("text",
+             x = 40,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +  
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"        ))+
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Cell Cycle",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,120)) +
+    theme_minimal()
+
+cellcycleprimonly
+
+fit <- lm(angio ~ timetotrial, data = finalexp)
+finalexp$predangio<-predict(fit,newdata = finalexp)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+anova(fit, test= "LRT")
+
+summary(fit)
+
+
+
+p_label <- "p = 1e-5"
+
+
+angioprimonly <- ggplot(finalexp, aes(x = timetotrialcut, y = angio,colour=site)) +
+    geom_point(alpha = 0.7) +
+  geom_line(aes(x=timetotrial,y=predangio),linewidth = 1.2)+
+    annotate("text",
+             x = 40,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +  
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"        ))+
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Angio",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,120)) +
+    theme_minimal()
+
+angioprimonly
+
+fit <- lm(stroma ~ timetotrial, data = finalexp)
+finalexp$predstroma<-predict(fit,newdata = finalexp)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+anova(fit, test= "LRT")
+
+summary(fit)
+
+
+
+p_label <- "p = 0.0076"
+
+
+stromaprimonly <- ggplot(finalexp, aes(x = timetotrialcut, y = stroma,colour=site)) +
+    geom_point(alpha = 0.7) +
+  geom_line(aes(x=timetotrial,y=predstroma),linewidth = 1.2)+
+    annotate("text",
+             x = 40,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +  
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"        ))+
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Stroma",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,120)) +
+    theme_minimal()
+
+stromaprimonly
+
+
+
+#hallmark
+design <- model.matrix(~ timetotrial
+                       
+                       , data = finalexp)
+
+ftpm<-tpmjav_num[match(finalexp$natid,rownames(tpmjav_z)),]
+
+
+fit_time <- lmFit(t(ftpm), design)
+fit_time <- eBayes(fit_time)
+
+
+rank_time <- fit_time$t[, "timetotrial"]
+names(rank_time) <- rownames(fit_time)
+
+rank_time <- sort(rank_time, decreasing = TRUE)
+
+
+fg_time <- fgsea(
+  pathways = hallmark_list,
+  stats = rank_time
+  , nperm = 1000000
+)
+
+fg_time_df <- as.data.frame(fg_time)
+
+ sig_time   <- fg_time_df$pathway[fg_time_df$padj < 0.05]
+
+fg_time_plot <- fg_time_df[match(pathways_keep, fg_time_df$pathway), ]
+
+fg_time_plot$order<-match(fg_time_plot$pathway,nes_mat$pathway)
+
+fg_time_plot$pathway_clean <- gsub("HALLMARK_", "", fg_time_plot$pathway)
+
+
+fg_time_plot$nesflip<-(-fg_time_plot$NES)
+
+hallmarkbarprimonly <- ggplot(fg_time_plot,
+                      aes(x = nesflip, y = reorder(pathway_clean, order), fill = nesflip)) +
+  geom_col() +
+      geom_text(
+    data = subset(fg_time_plot, padj < 0.05),
+    aes(label = "*",
+        hjust = ifelse(nesflip > 0, -0.3, 1.3)),
+    size = 6,
+    fontface = "bold"
+  ) +
+  scale_x_reverse() +
+  scale_y_discrete(expand = expansion(mult = c(0.1, 0.0))) +
+  scale_fill_gradient2(
+    low = "#2166ac",
+    mid = "gray95",
+    high = "#b2182b",
+    midpoint = 0,
+        limits = c(-2.3, 4.4),
+    name = "NES"
+  ) +
+  theme_minimal()  +
+    annotate(
+        "text",
+        x = 0,
+        y = 0,   # adjust depending on spacing
+        label = "← Enriched Earlier     Enriched Later →",
+        vjust = 1,  size = 3
+    )+
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(hjust = 0)
+  )+
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50")+
+  labs(
+    x = "",
+    y = "",
+    title = "Hallmark Pathway Enrichment Across Recurrence Time-\nJAVELIN Renal 101- Primary Tumor Sequencing Only"
+  )+theme(legend.position = "none")
+
+hallmarkbarprimonly
+
+# Right column: 2x2 grid of the smaller plots
+right_met <- plot_grid(
+  angiometonly, cellcyclemetonly,
+  stromametonly, wgiimetonly,
+  ncol = 2, nrow = 2
+)
+
+# Combine: hallmark on left (spanning full height), 2x2 on right
+combinemetsens <- plot_grid(
+  hallmarkbarmetonly, right_met,
+  ncol = 2,
+  rel_widths = c(1, 1.2)
+)
+
+right_prim <- plot_grid(
+  angioprimonly, cellcycleprimonly,
+  stromaprimonly, wgiiprimonly,
+  ncol = 2, nrow = 2
+)
+
+combineprimsens <- plot_grid(
+  hallmarkbarprimonly, right_prim,
+  ncol = 2,
+  rel_widths = c(1, 1.2)
+)
+
+#sarcomatoid only
+#sarcomatoid only
+#sarcomatoid only
+#sarcomatoid only
+#sarcomatoid only
+#sarcomatoid only
+
+finalexp<-subset(final,final$natid %in% rownames(tpmjav_z))
+finalexp <- subset(finalexp, categories != "De Novo Metastatic")
+finalexp<-subset(finalexp, finalexp$sarc=="FALSE")
+finalexp$timetotrial <- as.numeric(finalexp$timetotrial)
+# 
+# 
+# fit <- lm(wgii ~ timetotrial, data = finalexp)
+# finalexp$predwgii<-predict(fit,newdata = finalexp)
+# cbind(
+#   coef(fit),
+#   confint(fit)
+# )
+# 
+# anova(fit, test= "LRT")
+# 
+# summary(fit)
+# 
+# 
+# 
+# p_label <- "p = 0.062"
+# 
+# 
+# wgiinosarc <- ggplot(finalexp, aes(x = timetotrialcut, y = wgii,colour=site)) +
+#     geom_point(alpha = 0.7) +
+#   geom_line(aes(x=timetotrial,y=predwgii),linewidth = 1.2)+
+#     annotate("text",
+#              x = 40,
+#              y = 0.5,
+#              label = p_label,
+#              hjust = 0,
+#              size = 4) +  
+#   scale_color_manual(
+#                  values = c(
+#                      "KIDNEY" = "#4d9221",
+#                      "METASTASIS" = "#c51b7d"        ))+
+#     scale_x_continuous(
+#         breaks = c(0,30,60,90,120),
+#         labels = c("0","30","60","90",">120")
+#     ) +
+#     labs(
+#         x = "Recurrence Time (months)",
+#         y = "WGII",
+#   colour = "Sequencing\nSite"
+#     ) +
+#     coord_cartesian(ylim = c(0,0.7), xlim = c(0,120)) +
+#     theme_minimal()
+# 
+# wgiinosarc
+# 
+# fit <- lm(cellcycle ~ timetotrial, data = finalexp)
+# finalexp$predcellcycle<-predict(fit,newdata = finalexp)
+# cbind(
+#   coef(fit),
+#   confint(fit)
+# )
+# 
+# anova(fit, test= "LRT")
+# 
+# summary(fit)
+# 
+# 
+# 
+# p_label <- "p = 0.003"
+# 
+# 
+# cellcyclenosarc <- ggplot(finalexp, aes(x = timetotrialcut, y = cellcycle,colour=site)) +
+#     geom_point(alpha = 0.7) +
+#   geom_line(aes(x=timetotrial,y=predcellcycle),linewidth = 1.2)+
+#     annotate("text",
+#              x = 40,
+#              y = 2.2,
+#              label = p_label,
+#              hjust = 0,
+#              size = 4) +  
+#   scale_color_manual(
+#                  values = c(
+#                      "KIDNEY" = "#4d9221",
+#                      "METASTASIS" = "#c51b7d"        ))+
+#     scale_x_continuous(
+#         breaks = c(0,30,60,90,120),
+#         labels = c("0","30","60","90",">120")
+#     ) +
+#     labs(
+#         x = "Recurrence Time (months)",
+#         y = "Cell Cycle",
+#   colour = "Sequencing\nSite"
+#     ) +
+#     coord_cartesian(ylim = c(-3,3), xlim = c(0,120)) +
+#     theme_minimal()
+# 
+# cellcyclenosarc
+# 
+# fit <- lm(angio ~ timetotrial, data = finalexp)
+# finalexp$predangio<-predict(fit,newdata = finalexp)
+# cbind(
+#   coef(fit),
+#   confint(fit)
+# )
+# 
+# anova(fit, test= "LRT")
+# 
+# summary(fit)
+# 
+# 
+# 
+# p_label <- "p = 0.008"
+# 
+# 
+# angionosarc <- ggplot(finalexp, aes(x = timetotrialcut, y = angio,colour=site)) +
+#     geom_point(alpha = 0.7) +
+#   geom_line(aes(x=timetotrial,y=predangio),linewidth = 1.2)+
+#     annotate("text",
+#              x = 40,
+#              y = 2.2,
+#              label = p_label,
+#              hjust = 0,
+#              size = 4) +  
+#   scale_color_manual(
+#                  values = c(
+#                      "KIDNEY" = "#4d9221",
+#                      "METASTASIS" = "#c51b7d"        ))+
+#     scale_x_continuous(
+#         breaks = c(0,30,60,90,120),
+#         labels = c("0","30","60","90",">120")
+#     ) +
+#     labs(
+#         x = "Recurrence Time (months)",
+#         y = "Angio",
+#   colour = "Sequencing\nSite"
+#     ) +
+#     coord_cartesian(ylim = c(-3,3), xlim = c(0,120)) +
+#     theme_minimal()
+# 
+# angionosarc
+# 
+# fit <- lm(stroma ~ timetotrial, data = finalexp)
+# finalexp$predstroma<-predict(fit,newdata = finalexp)
+# cbind(
+#   coef(fit),
+#   confint(fit)
+# )
+# 
+# anova(fit, test= "LRT")
+# 
+# summary(fit)
+# 
+# 
+# 
+# p_label <- "p = 0.0014"
+# 
+# stromanosarc <- ggplot(finalexp, aes(x = timetotrialcut, y = stroma,colour=site)) +
+#     geom_point(alpha = 0.7) +
+#   geom_line(aes(x=timetotrial,y=predstroma),linewidth = 1.2)+
+#     annotate("text",
+#              x = 40,
+#              y = 2.2,
+#              label = p_label,
+#              hjust = 0,
+#              size = 4) +  
+#   scale_color_manual(
+#                  values = c(
+#                      "KIDNEY" = "#4d9221",
+#                      "METASTASIS" = "#c51b7d"        ))+
+#     scale_x_continuous(
+#         breaks = c(0,30,60,90,120),
+#         labels = c("0","30","60","90",">120")
+#     ) +
+#     labs(
+#         x = "Recurrence Time (months)",
+#         y = "Stroma",
+#   colour = "Sequencing\nSite"
+#     ) +
+#     coord_cartesian(ylim = c(-3,3), xlim = c(0,120)) +
+#     theme_minimal()
+# 
+# stromanosarc
+
+#hallmark
+design <- model.matrix(~ timetotrial+site
+                       
+                       , data = finalexp)
+
+ftpm<-tpmjav_num[match(finalexp$natid,rownames(tpmjav_z)),]
+
+
+fit_time <- lmFit(t(ftpm), design)
+fit_time <- eBayes(fit_time)
+
+
+rank_time <- fit_time$t[, "timetotrial"]
+names(rank_time) <- rownames(fit_time)
+
+rank_time <- sort(rank_time, decreasing = TRUE)
+
+
+fg_time <- fgsea(
+  pathways = hallmark_list,
+  stats = rank_time, nperm = 1000000
+)
+
+fg_time_df <- as.data.frame(fg_time)
+
+ sig_time   <- fg_time_df$pathway[fg_time_df$padj < 0.05]
+
+fg_time_plot <- fg_time_df[match(pathways_keep, fg_time_df$pathway), ]
+
+fg_time_plot$order<-match(fg_time_plot$pathway,nes_mat$pathway)
+
+fg_time_plot$pathway_clean <- gsub("HALLMARK_", "", fg_time_plot$pathway)
+
+
+fg_time_plot$nesflip<-(-fg_time_plot$NES)
+
+hallmarkbarnosarc <- ggplot(fg_time_plot,
+                      aes(x = nesflip, y = reorder(pathway_clean, order), fill = nesflip)) +
+  geom_col() +
+      geom_text(
+    data = subset(fg_time_plot, padj < 0.05),
+    aes(label = "*",
+        hjust = ifelse(nesflip > 0, -0.3, 1.3)),
+    size = 6,
+    fontface = "bold"
+  ) +
+  scale_x_reverse() +
+  scale_y_discrete(expand = expansion(mult = c(0.1, 0.0))) +
+  scale_fill_gradient2(
+    low = "#2166ac",
+    mid = "gray95",
+    high = "#b2182b",
+    midpoint = 0,
+        limits = c(-2.3, 4.3),
+    name = "NES"
+  ) +
+  theme_minimal()  +
+    annotate(
+        "text",
+        x = 0,
+        y = 0,   # adjust depending on spacing
+        label = "← Enriched Earlier     Enriched Later →",
+        vjust = 1,  size = 3
+    )+
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(hjust = 0)
+  )+
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50")+
+  labs(
+    x = "",
+    y = "",
+    title = "Hallmark Pathway Enrichment Across Recurrence Time-\nJAVELIN Renal 101- Excluding Sarcomatoid (n=319)"
+  )+theme(legend.position = "none")
+
+
+##high grade only (3/4)
+
+##high grade only (3/4)
+##high grade only (3/4)
+##high grade only (3/4)
+##high grade only (3/4)
+
+
+finalexp<-subset(final,final$natid %in% rownames(tpmjav_z))
+finalexp <- subset(finalexp, categories != "De Novo Metastatic")
+finalexp<-subset(finalexp, finalexp$grade %in% c("GRADE 3","GRADE 4"))
+finalexp$timetotrial <- as.numeric(finalexp$timetotrial)
+
+#hallmark
+design <- model.matrix(~ timetotrial+site
+                       
+                       , data = finalexp)
+
+ftpm<-tpmjav_num[match(finalexp$natid,rownames(tpmjav_z)),]
+
+
+fit_time <- lmFit(t(ftpm), design)
+fit_time <- eBayes(fit_time)
+
+
+rank_time <- fit_time$t[, "timetotrial"]
+names(rank_time) <- rownames(fit_time)
+
+rank_time <- sort(rank_time, decreasing = TRUE)
+
+
+fg_time <- fgsea(
+  pathways = hallmark_list,
+  stats = rank_time, nperm = 1000000
+)
+
+fg_time_df <- as.data.frame(fg_time)
+
+ sig_time   <- fg_time_df$pathway[fg_time_df$padj < 0.05]
+
+fg_time_plot <- fg_time_df[match(pathways_keep, fg_time_df$pathway), ]
+
+fg_time_plot$order<-match(fg_time_plot$pathway,nes_mat$pathway)
+
+fg_time_plot$pathway_clean <- gsub("HALLMARK_", "", fg_time_plot$pathway)
+
+
+fg_time_plot$nesflip<-(-fg_time_plot$NES)
+
+hallmarkbarhighgrade <- ggplot(fg_time_plot,
+                      aes(x = nesflip, y = reorder(pathway_clean, order), fill = nesflip)) +
+  geom_col() +
+      geom_text(
+    data = subset(fg_time_plot, padj < 0.05),
+    aes(label = "*",
+        hjust = ifelse(nesflip > 0, -0.3, 1.3)),
+    size = 6,
+    fontface = "bold"
+  ) +
+  scale_x_reverse() +
+  scale_y_discrete(expand = expansion(mult = c(0.1, 0.0))) +
+  scale_fill_gradient2(
+    low = "#2166ac",
+    mid = "gray95",
+    high = "#b2182b",
+    midpoint = 0,
+        limits = c(-2.3, 4.3),
+    name = "NES"
+  ) +
+  theme_minimal()  +
+    annotate(
+        "text",
+        x = 0,
+        y = 0,   # adjust depending on spacing
+        label = "← Enriched Earlier     Enriched Later →",
+        vjust = 1,  size = 3
+    )+
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(hjust = 0)
+  )+
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50")+
+  labs(
+    x = "",
+    y = "",
+    title = "Hallmark Pathway Enrichment Across Recurrence Time-\nJAVELIN Renal 101- High-Grade Only (ISUP/Fuhrman 3 or 4; n=220)"
+  )+theme(legend.position = "none")
+
+hallmarkbarhighgrade
+
+#low grade only
+
+
+finalexp<-subset(final,final$natid %in% rownames(tpmjav_z))
+finalexp <- subset(finalexp, categories != "De Novo Metastatic")
+finalexp<-subset(finalexp, finalexp$grade %in% c("GRADE 1","GRADE 2"))
+finalexp$timetotrial <- as.numeric(finalexp$timetotrial)
+
+#hallmark
+design <- model.matrix(~ timetotrial+site
+                       
+                       , data = finalexp)
+
+ftpm<-tpmjav_num[match(finalexp$natid,rownames(tpmjav_z)),]
+
+
+fit_time <- lmFit(t(ftpm), design)
+fit_time <- eBayes(fit_time)
+
+
+rank_time <- fit_time$t[, "timetotrial"]
+names(rank_time) <- rownames(fit_time)
+
+rank_time <- sort(rank_time, decreasing = TRUE)
+
+
+fg_time <- fgsea(
+  pathways = hallmark_list,
+  stats = rank_time, nperm = 1000000
+)
+
+fg_time_df <- as.data.frame(fg_time)
+
+ sig_time   <- fg_time_df$pathway[fg_time_df$padj < 0.05]
+
+fg_time_plot <- fg_time_df[match(pathways_keep, fg_time_df$pathway), ]
+
+fg_time_plot$order<-match(fg_time_plot$pathway,nes_mat$pathway)
+
+fg_time_plot$pathway_clean <- gsub("HALLMARK_", "", fg_time_plot$pathway)
+
+
+fg_time_plot$nesflip<-(-fg_time_plot$NES)
+
+hallmarkbarlowgrade <- ggplot(fg_time_plot,
+                      aes(x = nesflip, y = reorder(pathway_clean, order), fill = nesflip)) +
+  geom_col() +
+      geom_text(
+    data = subset(fg_time_plot, padj < 0.05),
+    aes(label = "*",
+        hjust = ifelse(nesflip > 0, -0.3, 1.3)),
+    size = 6,
+    fontface = "bold"
+  ) +
+  scale_x_reverse() +
+  scale_y_discrete(expand = expansion(mult = c(0.1, 0.0))) +
+  scale_fill_gradient2(
+    low = "#2166ac",
+    mid = "gray95",
+    high = "#b2182b",
+    midpoint = 0,
+        limits = c(-2.3, 4.3),
+    name = "NES"
+  ) +
+  theme_minimal()  +
+    annotate(
+        "text",
+        x = 0,
+        y = 0,   # adjust depending on spacing
+        label = "← Enriched Earlier     Enriched Later →",
+        vjust = 1,  size = 3
+    )+
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(hjust = 0)
+  )+
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50")+
+  labs(
+    x = "",
+    y = "",
+    title = "Hallmark Pathway Enrichment Across Recurrence Time-\nJAVELIN Renal 101- Low-Grade Only (ISUP/Fuhrman 1 or 2; n=117)"
+  )+theme(legend.position = "none")
+
+hallmarkbarlowgrade
+
+
+combhisthallmark <- plot_grid(hallmarkbar,
+  hallmarkbarnosarc, hallmarkbarhighgrade,
+  hallmarkbarlowgrade,
+  ncol = 2
+)
+
+```
+
+
+```{r IMM151 molecular cluster analysis}
+
+
+#random forest
+#https://www.projectpro.io/recipes/perform-random-forest-r
+
+immexp <- read_csv("/Users/smonda/Library/CloudStorage/OneDrive-MichiganMedicine/Research/M vs P/Final/IMM151_TPM.csv")
+
+#already looks log2 tpm
+
+immexp<-as.data.frame(immexp)
+#remove na genes
+immexp<-subset(immexp,!is.na(immexp$symbol))
+#removes duplicated genes
+immexp<-subset(immexp,!duplicated(immexp$symbol))
+
+#row names to genes
+rownames(immexp) <- immexp$symbol
+
+
+#can only run this part once
+immexp<- immexp[,!colnames(immexp) %in% c("symbol","gene_name","...1")]
+
+#z-score transformed
+immexpz<-data.frame(scale(data.frame(t(immexp))))
+
+library(matrixStats)
+
+immclin <- read_csv("/Users/smonda/Library/CloudStorage/OneDrive-MichiganMedicine/Research/M vs P/Final/IMM151_clinical.csv", 
+                    skip = 3)
+
+immclin<- subset(immclin,immclin$RNASEQ_SAMPLE_ID %in% colnames(immexp))
+#10% most variable genes in IMM151
+imm10genes<-names(sort(rowVars(as.matrix(immexp)),decreasing=TRUE)[1:(nrow(immexp)/10)])
+imm10genes<-subset(imm10genes,imm10genes %in% colnames(immexpz))
+sharedimm10genes<-intersect(colnames(tpmjav_z),imm10genes)
+
+#then isolates to shared genes
+#using javelin genes
+immnmftarget<-as.factor(immclin$NMF_GROUP)
+
+training<-immexpz[,sharedimm10genes]
+#reorder to align with immclin
+training<-training[immclin$RNASEQ_SAMPLE_ID,]
+
+model<-randomForest(immnmftarget~.,data= training)
+
+#OOB estimate of  error rate: 17.5%
+
+#input data
+rfinput<-tpmjav_z[,sharedimm10genes]
+# rfinput<-tpm_z[,sharedimm10genes]
+
+#as.data.frame(lapply(nexpz[,PMgenes], type.convert, as.is = TRUE))
+
+nmf<-data.frame(predict(model,newdata=rfinput))
+
+nmf$id<-rownames(rfinput)
+
+# cancerhx$nmf<-nmf$predict.model..newdata...rfinput.[match(cancerhx$USUBJID,nmf$id)]
+
+final$nmf<-nmf$predict.model..newdata...rfinput.[match(final$natid,nmf$id)]
+
+finals<-subset(final,!is.na(final$nmf))
+
+categories_plot<-finals %>%
+    mutate(
+        categories_plot = factor(
+            categories_plot,
+            levels = c("De Novo Metastatic","early","intermediate","late"),
+            labels = c("De Novo Metastatic",
+                       "Early Recurrent",
+                       "Intermediate Recurrent",
+                       "Late Recurrent")
+        ),
+        site = factor(site, levels = c("KIDNEY","METASTASIS"))
+    ) %>%
+    count(categories_plot, site, nmf) %>%
+    group_by(categories_plot, site) %>%
+    mutate(prop = n / sum(n)) %>%
+    ggplot(
+        aes(
+            x = interaction(categories_plot, site),
+            y = prop,
+            fill = nmf
+        )
+    ) +
+    geom_col(color = "black") +
+    
+    # Y axis as %
+    scale_y_continuous(labels = label_percent()) +
+    
+    # Only show recurrence labels (remove KIDNEY/METASTASIS)
+    scale_x_discrete(
+        labels = function(x) {
+            parts <- strsplit(x, "\\.")
+            sapply(parts, function(p) p[1])
+        }
+    ) +
+    
+    labs(
+        x = NULL,
+        y = "Percentage",
+        fill = "NMF subtype",
+        title = "IMM151 Molecular Cluster Distribution by Recurrence Timing and Site in JAVELIN Renal 101 (n=599)"
+    ) +
+    
+    # Group labels underneath (PRIMARY vs METASTATIC)
+    annotate(
+        "text",
+        x = c(2.5, 6.5),
+        y = -0.01,
+        label = c("Primary Tumor Sequencing",
+                  "Metastatic Site Sequencing"),
+        vjust = 1,
+        size = 3.5
+    ) +
+    
+    # Allow drawing outside panel
+    coord_cartesian(ylim = c(0, 1), clip = "off") +
+    
+    theme_minimal() +
+    theme(
+        axis.text.x = element_text(size = 10),
+        plot.margin = ggplot2::margin(10, 10, 50, 10)
+    )+ geom_vline(xintercept = 4.5, linewidth = 0.8, color = "black")+
+  scale_fill_manual(
+  values = scales::hue_pal()(7),  # keeps default-like colors
+  breaks = c("1","2","3","4","5","6","7"),
+  labels = c(
+    "1. Angio/stromal",
+    "2. Angio",
+    "3. Compl./ox.",
+    "4. T-effector/prolif.",
+    "5. Prolif.",
+    "6. Stromal/prolif.",
+    "7. snoRNA"
+  )
+)
+
+categories_plot
+
+imm010plot<-imm010placeborec
+imm010plot<-imm010plot[!is.na(imm010plot$NMF_SUBTYPE),]
+
+imm010categories_plotplacebo<-imm010plot %>%
+    mutate(
+        categories_plot = factor(
+            categories_plot,
+            levels = c("early","intermediate"),
+            labels = c(
+                       "Early Recurrent",
+                       "Intermediate Recurrent")),
+                    NMF_SUBTYPE = factor(NMF_SUBTYPE, levels = c("1","2","3","4","5","6","7")
+        )
+    ) %>%
+    count(categories_plot, NMF_SUBTYPE) %>%
+    group_by(categories_plot) %>%
+    mutate(prop = n / sum(n)) %>%
+    ggplot(
+        aes(
+            x = interaction(categories_plot),
+            y = prop,
+            fill = NMF_SUBTYPE
+        )
+    ) +
+    geom_col(color = "black") +
+    
+    # Y axis as %
+    scale_y_continuous(labels = label_percent()) +
+    
+    # Only show recurrence labels (remove KIDNEY/METASTASIS)
+    scale_x_discrete(
+        labels = function(x) {
+            parts <- strsplit(x, "\\.")
+            sapply(parts, function(p) p[1])
+        }
+    ) +
+    
+    labs(
+        x = NULL,
+        y = "Percentage",
+        fill = "NMF subtype",
+        title = "IMM151 Molecular Cluster in IMmotion010 (placebo, n=87)"
+    ) +
+    
+
+    
+    # Allow drawing outside panel
+    coord_cartesian(ylim = c(0, 1), clip = "off") +
+    
+    theme_minimal() +
+    theme(
+        axis.text.x = element_text(size = 10),
+        plot.margin = ggplot2::margin(10, 10, 50, 10))+
+  scale_fill_manual(
+  values = scales::hue_pal()(7),  # keeps default-like colors
+  breaks = c("1","2","3","4","5","6","7"),
+  labels = c(
+    "1. Angio/stromal",
+    "2. Angio",
+    "3. Compl./ox.",
+    "4. T-effector/prolif.",
+    "5. Prolif.",
+    "6. Stromal/prolif.",
+    "7. snoRNA"
+  )
+)
+
+
+
+imm010categories_plotplacebo
+
+imm010plot<-imm010atezorec
+imm010plot<-imm010plot[!is.na(imm010plot$NMF_SUBTYPE),]
+
+imm010categories_plotatezo<-imm010plot %>%
+    mutate(
+        categories_plot = factor(
+            categories_plot,
+            levels = c("early","intermediate"),
+            labels = c(
+                       "Early Recurrent",
+                       "Intermediate Recurrent")),
+                    NMF_SUBTYPE = factor(NMF_SUBTYPE, levels = c("1","2","3","4","5","6","7")
+        )
+    ) %>%
+    count(categories_plot, NMF_SUBTYPE) %>%
+    group_by(categories_plot) %>%
+    mutate(prop = n / sum(n)) %>%
+    ggplot(
+        aes(
+            x = interaction(categories_plot),
+            y = prop,
+            fill = NMF_SUBTYPE
+        )
+    ) +
+    geom_col(color = "black") +
+    
+    # Y axis as %
+    scale_y_continuous(labels = label_percent()) +
+    
+    # Only show recurrence labels (remove KIDNEY/METASTASIS)
+    scale_x_discrete(
+        labels = function(x) {
+            parts <- strsplit(x, "\\.")
+            sapply(parts, function(p) p[1])
+        }
+    ) +
+    
+    labs(
+        x = NULL,
+        y = "Percentage",
+        fill = "NMF subtype",
+        title = "IMM151 Molecular Cluster in IMmotion010 (atezo, n=76)"
+    ) +
+    
+
+    
+    # Allow drawing outside panel
+    coord_cartesian(ylim = c(0, 1), clip = "off") +
+    
+    theme_minimal() +
+    theme(
+        axis.text.x = element_text(size = 10),
+        plot.margin = ggplot2::margin(10, 10, 50, 10))+
+  scale_fill_manual(
+  values = scales::hue_pal()(7),  # keeps default-like colors
+  breaks = c("1","2","3","4","5","6","7"),
+  labels = c(
+    "1. Angio/stromal",
+    "2. Angio",
+    "3. Compl./ox.",
+    "4. T-effector/prolif.",
+    "5. Prolif.",
+    "6. Stromal/prolif.",
+    "7. snoRNA"
+  )
+)
+
+#create the same thing IMM010 data
+imm010categories_plotatezo
+
+```
+
+## Establishing adjusted IMDC risk factors are can be included as continuous variable with linear effect in downstream analyses
+```{r IMDC linear vs spline assessment}
+
+#Frank Harrel RMS was used for this approach- plotting the HR CI 95% and assessing non-linearity with ANOVA
+
+dd <- datadist(fpfs)
+options(datadist = "dd")
+
+fit_spline <- cph(Surv(as.numeric(AVALC), CNSR == "0") ~ 
+                  categories + ARMCD + rcs(imdc,3),
+                  data = fpfs,
+                  x=TRUE, y=TRUE)
+
+
+
+p_imdc <- Predict(fit_spline, imdc, fun = exp)
+
+plot(p_imdc,
+     xlab = "Modified IMDC (0–4)",
+     ylab = "Hazard Ratio",
+     main = "Effect of Modified IMDC on PFS",
+     lwd = 2)
+
+anova(fit_spline)
+
+```
+
+## Prognostic Analysis- PFS is primary outcome, first - survival ~ recurrence_category + arm
+second - survival ~ recurrence_category + arm + imdc
+
+Then repeat for DSS and OS
+
+You can also embed plots, for example:
+
+
+
+```{r prognostic cox analysis}
+#PFS primary
+fpfs$ARMCD <- factor(fpfs$ARMCD)
+fpfs$ARMCD <- relevel(fpfs$ARMCD, ref="Sunitinib")
+fos$ARMCD <- factor(fos$ARMCD)
+fos$ARMCD <- relevel(fos$ARMCD, ref = "Sunitinib")
+
+#unadjusted-only arm
+fpfs$categories <- factor(fpfs$categories)
+fpfs$categories <- relevel(fpfs$categories, ref = "De Novo Metastatic")
+
+foss<-fos[fpfs$ARMCD=="Sunitinib",]
+fosa<-fos[fpfs$ARMCD!="Sunitinib",]
+fpfss<-fpfs[fpfs$ARMCD=="Sunitinib",]
+fpfsa<-fpfs[fpfs$ARMCD!="Sunitinib",]
+
+
+coxpfs<-coxph(Surv(as.numeric(AVALC), CNSR == "0"
+           ) ~              ARMCD+categories     ,
+                    data = fpfs)
+coxpfs
+summary(coxpfs)
+
+#adjusted- arm + imdc
+
+coxadjpfs<-coxph(Surv(as.numeric(AVALC), CNSR == "0"
+           ) ~              ARMCD+categories  +imdc   ,
+                    data = fpfs)
+coxadjpfs
+summary(coxadjpfs)
+
+#OS- secondary 1
+
+#unadjusted-only arm
+coxos<-coxph(Surv(as.numeric(AVALC), CNSR == "0"
+           ) ~              ARMCD+categories     ,
+                    data = fos)
+coxos
+summary(coxos)
+
+#adjusted- arm + imdc
+
+coxadjos<-coxph(Surv(as.numeric(AVALC), CNSR == "0"
+           ) ~              ARMCD+categories  +imdc   ,
+                    data = fos)
+coxadjos
+summary(coxadjos)
+
+
+#DSS- secondary 2
+#unadjusted-only arm
+coxdss<-coxph(Surv(as.numeric(AVALC), CNSR == "0"& ADTHCAUS == "DISEASE PROGRESSION"
+           ) ~              ARMCD+categories     ,
+                    data = fos)
+coxdss
+summary(coxdss)
+
+#adjusted- arm + imdc
+
+coxadjdss<-coxph(Surv(as.numeric(AVALC), CNSR == "0"& ADTHCAUS == "DISEASE PROGRESSION"
+           ) ~              ARMCD+categories  +imdc   ,
+                    data = fos)
+coxadjdss
+summary(coxadjdss)
+
+
+# Global test
+#now global tests for the impact of category
+# Reduced model (no categories)
+cox_pfs_no_cat <- coxph(
+  Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD,
+  data = fpfs
+)
+
+
+anova(cox_pfs_no_cat, coxpfs, test = "LRT")
+
+cox_pfs_no_cat_adj <- coxph(
+  Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD + imdc,
+  data = fpfs
+)
+
+anova(cox_pfs_no_cat_adj, coxadjpfs, test = "LRT")
+
+cox_os_no_cat <- coxph(
+  Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD,
+  data = fos
+)
+
+anova(cox_os_no_cat, coxos, test = "LRT")
+
+cox_os_no_cat_adj <- coxph(
+  Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD + imdc,
+  data = fos
+)
+
+anova(cox_os_no_cat_adj, coxadjos, test = "LRT")
+
+cox_dss_no_cat <- coxph(
+  Surv(as.numeric(AVALC),
+       CNSR == "0" & ADTHCAUS == "DISEASE PROGRESSION") ~ ARMCD,
+  data = fos
+)
+
+anova(cox_dss_no_cat, coxdss, test = "LRT")
+
+cox_dss_no_cat_adj <- coxph(
+  Surv(as.numeric(AVALC),
+       CNSR == "0" & ADTHCAUS == "DISEASE PROGRESSION") ~ ARMCD + imdc,
+  data = fos
+)
+
+anova(cox_dss_no_cat_adj, coxadjdss, test = "LRT")
+
+```
+#KM Curves for Prognostic Assessment
+``` {r KM prognostic }
+
+
+um_colors <- c(
+  "#00274C",  # Michigan Blue
+  "#FFCB05",  # Michigan Maize
+  "#6CACE4",  # light blue accent
+  "#9A3324"   # optional burgundy accent (nice contrast)
+)
+
+
+pfsprog <- 
+  ggsurvplot(
+  survfit(Surv(as.numeric(AVALC), CNSR == "0") ~ categories, data = fpfs),
+  data = fpfs,
+  risk.table = TRUE,
+  xlab = "Time (months)",
+  ylab = "Progression Free Survival",
+  title = "Progression-Free Survival by Recurrence Status",
+  legend.title = "",
+  xlim = c(0, 60),
+  break.time.by = 12,
+  palette = um_colors,
+  legend.labs = c(
+    "De Novo Metastatic",
+    "Early Recurrent",
+    "Intermediate Recurrent",
+    "Late Recurrent"
+  ),
+  surv.scale = "percent",
+  ggtheme = theme_minimal(base_size = 14)
+)
+
+pfsprog
+
+pfsprogs <-   ggsurvplot(
+  survfit(Surv(as.numeric(AVALC), CNSR == "0") ~ categories, data = fpfss),
+  data = fpfs,
+  risk.table = TRUE,
+  xlab = "Time (months)",
+  ylab = "Progression Free Survival",
+  title = "Progression-Free Survival by Recurrence Status\nSunitinib Arm (n=355)",
+  legend.title = "",
+  xlim = c(0, 60),
+  break.time.by = 12,
+  palette = um_colors,
+  legend.labs = c(
+    "De Novo Metastatic",
+    "Early Recurrent",
+    "Intermediate Recurrent",
+    "Late Recurrent"
+  ),
+  surv.scale = "percent",
+  ggtheme = theme_minimal(base_size = 14)
+)
+
+pfsprogs
+
+pfsproga <-   ggsurvplot(
+  survfit(Surv(as.numeric(AVALC), CNSR == "0") ~ categories, data = fpfsa),
+  data = fpfs,
+  risk.table = TRUE,
+  xlab = "Time (months)",
+  ylab = "Progression Free Survival",
+  title = "Progression-Free Survival by Recurrence Status\nAvelumab+Axitinib Arm (n=361)",
+  legend.title = "",
+  xlim = c(0, 60),
+  break.time.by = 12,
+  palette = um_colors,
+  legend.labs = c(
+    "De Novo Metastatic",
+    "Early Recurrent",
+    "Intermediate Recurrent",
+    "Late Recurrent"
+  ),
+  surv.scale = "percent",
+  ggtheme = theme_minimal(base_size = 14)
+)
+
+pfsproga
+
+
+osprog <- ggsurvplot(
+  survfit(Surv(as.numeric(AVALC), CNSR == "0") ~ categories, data = fos),
+  data = fos,
+  risk.table = TRUE,
+  xlab = "Time (months)",
+  ylab = "Overall Survival",
+  title = "Overall Survival by Recurrence Status\n(n=706)",
+  legend.title = "",
+  xlim = c(0, 60),
+  break.time.by = 12,
+  palette = um_colors,
+  legend.labs = c(
+    "De Novo Metastatic",
+    "Early Recurrent",
+    "Intermediate Recurrent",
+    "Late Recurrent"
+  ),
+  surv.scale = "percent",
+  ggtheme = theme_minimal(base_size = 14)
+)
+osprog
+
+osproga <- ggsurvplot(
+  survfit(Surv(as.numeric(AVALC), CNSR == "0") ~ categories, data = fosa),
+  data = fos,
+  risk.table = TRUE,
+  xlab = "Time (months)",
+  ylab = "Overall Survival",
+  title = "Overall Survival by Recurrence Status Avelumab Arm",
+  legend.title = "",
+  xlim = c(0, 60),
+  break.time.by = 12,
+  palette = um_colors,
+  legend.labs = c(
+    "De Novo Metastatic",
+    "Early Recurrent",
+    "Intermediate Recurrent",
+    "Late Recurrent"
+  ),
+  surv.scale = "percent",
+  ggtheme = theme_minimal(base_size = 14)
+)
+osproga
+
+osprogs <- ggsurvplot(
+  survfit(Surv(as.numeric(AVALC), CNSR == "0") ~ categories, data = foss),
+  data = fos,
+  risk.table = TRUE,
+  xlab = "Time (months)",
+  ylab = "Overall Survival",
+  title = "Overall Survival by Recurrence Status-Sunitinib Arm",
+  legend.title = "",
+  xlim = c(0, 60),
+  break.time.by = 12,
+  palette = um_colors,
+  legend.labs = c(
+    "De Novo Metastatic",
+    "Early Recurrent",
+    "Intermediate Recurrent",
+    "Late Recurrent"
+  ),
+  surv.scale = "percent",
+  ggtheme = theme_minimal(base_size = 14)
+)
+osprogs
+
+
+dssprog <- ggsurvplot(
+  survfit(Surv(as.numeric(AVALC), CNSR == "0"&fos$ADTHCAUS=="DISEASE PROGRESSION") ~ categories, data = fos),
+  data = fos,
+  risk.table = TRUE,
+  xlab = "Time (months)",
+  ylab = "Overall Survival",
+  title = "Disease Specific Survival by Recurrence Status",
+  legend.title = "",
+  xlim = c(0, 60),
+  break.time.by = 12,
+  palette = um_colors,
+  legend.labs = c(
+    "De Novo Metastatic",
+    "Early Recurrent",
+    "Intermediate Recurrent",
+    "Late Recurrent"
+  ),
+  surv.scale = "percent",
+  ggtheme = theme_minimal(base_size = 14)
+)
+
+dssprog
+pfs_full <- plot_grid(
+  pfsprog$plot,
+  pfsprog$table,
+  ncol = 1,
+  rel_heights = c(3, 1)
+)
+
+os_full <- plot_grid(
+  osprog$plot,
+  osprog$table,
+  ncol = 1,
+  rel_heights = c(3, 1)
+)
+
+dss_full <- plot_grid(
+  dssprog$plot,
+  dssprog$table,
+  ncol = 1,
+  rel_heights = c(3, 1)
+)
+
+pfss_full <- plot_grid(
+  pfsprogs$plot,
+  pfsprogs$table,
+  ncol = 1,
+  rel_heights = c(3, 1)
+)
+
+pfsa_full <- plot_grid(
+  pfsproga$plot,
+  pfsproga$table,
+  ncol = 1,
+  rel_heights = c(3, 1)
+)
+
+p_all <- plot_grid(
+  pfss_full,
+  pfsa_full,
+  os_full,
+    nrow = 1,
+  align = "hv",
+  axis = "tblr"
+)
+
+p_all
+
+```
+
+
+``` {r PFS HR subgroup analysis}
+
+df <- data.frame(fpfs)
+df$ARMCD <- factor(df$ARMCD, levels = c("Sunitinib","Avelumab + Axitinib"))
+
+# Ensure expected types
+df <- df %>%
+  mutate(
+    # event indicator: TRUE if event, FALSE if censored
+    event = CNSR %in% c("0", 0),
+    time  = as.numeric(AVALC),
+    ARMCD = factor(ARMCD),
+    categories = factor(categories,
+                        levels = c("De Novo Metastatic","early","intermediate","late"))
+  )
+
+# >>>> OPTIONAL: set your desired reference arm here (edit "Control" as needed) <<<<
+# df$ARMCD <- relevel(df$ARMCD, ref = "Control")
+
+# Helper: fit Cox in a subset and extract HR (with CI) for each non-reference level of ARMCD
+fit_subset <- function(dat, subgroup_label) {
+  dat <- dat %>% filter(!is.na(time), !is.na(event), !is.na(ARMCD))
+  if (nlevels(dat$ARMCD) < 2L || nrow(dat) == 0L) {
+    return(tibble(subgroup = character(), arm = character(),
+                  hr = numeric(), lo = numeric(), hi = numeric(),
+                  p = numeric(), n = integer(), events = integer()))
+  }
+  fit <- coxph(Surv(time, event) ~ ARMCD, data = dat)
+  s   <- summary(fit)
+  
+  # rows correspond to comparisons vs reference arm
+  comp_rows <- rownames(s$coefficients)
+  comp_arm  <- sub("^ARMCD", "", comp_rows)
+  
+  # confint for coxph returns log-scale; exponentiate to HR scale
+  ci <- suppressMessages(confint(fit))
+  tibble(
+    subgroup = subgroup_label,
+    arm      = comp_arm,
+    hr       = as.numeric(exp(s$coefficients[, "coef"])),
+    lo       = as.numeric(exp(ci[, 1])),
+    hi       = as.numeric(exp(ci[, 2])),
+    p        = as.numeric(s$coefficients[, "Pr(>|z|)"]),
+    n        = nrow(dat),
+    events   = sum(dat$event, na.rm = TRUE)
+  )
+}
+
+# Define the sets: overall + each category
+sets <- list(
+  "All evaluated patients"        = df,
+  "De Novo Metastatic"  = df %>% filter(categories == "De Novo Metastatic"),
+  "Early"               = df %>% filter(categories == "early"),
+  "Intermediate"            = df %>% filter(categories == "intermediate"),
+  "Late"                = df %>% filter(categories == "late")
+)
+
+# Fit all
+res <- bind_rows(Map(fit_subset, sets, names(sets)))
+
+# Make pretty labels and plotting order
+res <- res %>%
+  mutate(
+    line = paste0(subgroup, 
+                  "   (n=", n, ", events=", events, ")"),
+    line = factor(line, levels = rev(unique(line))) # top=overall
+  )
+
+# Axis limits (log scale) with a little padding
+xmin <- max(min(res$lo, na.rm = TRUE), 0.05)
+xmax <- max(res$hi, na.rm = TRUE) * 1.15
+
+res <- res %>%
+  mutate(
+    hr_label = sprintf("%.2f (%.2f–%.2f)", hr, lo, hi)
+  )
+
+# Forest plot
+forestplot<-ggplot(res, aes(y = line, x = hr)) +
+    
+    # HR text column on left
+    geom_text(aes(x = 0.07, label = hr_label),
+              hjust = 0,
+              size = 3.5) +
+    
+    # CI + point
+    geom_point(size = 2.5) +
+    geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.18) +
+    
+    # Reference line
+    geom_vline(xintercept = 1, linetype = "dashed") +
+    annotate(
+  "text",
+  x = 0.88,
+  y = 0.3,   # slightly below lowest row
+  label = "Avelumab + Axitinib Better    <=>    Sunitinib Better",
+  vjust =0,
+  size = 3.5
+)+
+coord_cartesian(clip = "off") +
+    # Log scale with extra room on left
+    scale_x_log10(
+        limits = c(0.07, 2),
+        breaks = c(0.25, 0.5, 1, 1.5, 2),
+        minor_breaks = NULL
+    ) +
+    
+    labs(
+        x = NULL,
+        y = NULL,
+        title = "Recurrence Subgroup Analysis for Progression-Free Survival",
+    ) +
+    
+    theme_minimal(base_size = 12) +
+    theme(
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(hjust = 0),
+        axis.text.y = element_text(hjust = 0),
+        plot.margin = ggplot2::margin(5.5, 30, 5.5, 30)# creates left padding
+    )+
+  geom_text(
+  data = data.frame(),
+  aes(x = 0.07, 
+      y = length(levels(res$line)) + 0.4),
+  label = "HR (95% CI)",
+  hjust = 0,
+  fontface = "bold",
+  size = 3.8,
+  inherit.aes = FALSE
+)
+  
+
+fpfsil<-subset(fpfs,fpfs$categories %in% c("intermediate","late"))
+
+fpfsde<-subset(fpfs,!fpfs$categories %in% c("intermediate","late"))
+
+fpfsi<-subset(fpfs,fpfs$categories %in% c("intermediate"))
+
+fpfse<-subset(fpfs,fpfs$categories %in% c("early"))
+
+fpfsl<-subset(fpfs,fpfs$categories %in% c("late"))
+
+fpfsd<-subset(fpfs,fpfs$categories %in% c("De Novo Metastatic"))
+
+
+
+pfsil<-ggsurvplot(
+  survfit(Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD, data = fpfsil),
+  data = fpfsil,
+  risk.table = TRUE,
+    title="Intermediate + Late Recurrence (n=283)",
+  xlab = "Time (months)",
+  ylab = "Progression Free Survival",
+    pval = TRUE,
+  # title = "Progression-Free Survival by Recurrence Status",
+  legend.title = "",
+  xlim = c(0, 60),
+  break.time.by = 12,
+  palette = um_colors,
+  legend.labs = c(
+    "Sunitinib",
+        "Avelumab + Axitinib"
+  ),
+  surv.scale = "percent",
+  ggtheme = theme_minimal(base_size = 14)
+)
+
+pfsde<-ggsurvplot(
+  survfit(Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD, data = fpfsde),
+  data = fpfsde,
+  risk.table = TRUE,
+  title="De Novo + Early Recurrence (n=433)",
+  xlab = "Time (months)",
+  ylab = "Progression Free Survival",
+  pval = TRUE,
+  # title = "Progression-Free Survival by Recurrence Status",
+  legend.title = "",
+  xlim = c(0, 60),
+  break.time.by = 12,
+  palette = um_colors,
+  legend.labs = c(
+    "Sunitinib",
+    "Avelumab + Axitinib"
+      ),
+  surv.scale = "percent",
+  ggtheme = theme_minimal(base_size = 14)
+)
+
+
+pfse<-ggsurvplot(
+  survfit(Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD, data = fpfse),
+  data = fpfse,
+  risk.table = TRUE,
+  title="Early Recurrence (n=137)",
+  xlab = "Time (months)",
+  ylab = "Progression Free Survival",
+    pval = TRUE,
+  # title = "Progression-Free Survival by Recurrence Status",
+  legend.title = "",
+  xlim = c(0, 60),
+  break.time.by = 12,
+  palette = um_colors,
+  legend.labs = c(
+    "Sunitinib",
+    "Avelumab + Axitinib"
+      ),
+  surv.scale = "percent",
+  ggtheme = theme_minimal(base_size = 14)
+)
+
+
+pfsd<-ggsurvplot(
+  survfit(Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD, data = fpfsd),
+  data = fpfsd,
+  risk.table = TRUE,
+  title="De Novo Metastatic (n=296)",
+  xlab = "Time (months)",
+    pval = TRUE,
+  ylab = "Progression Free Survival",
+  # title = "Progression-Free Survival by Recurrence Status",
+  legend.title = "",
+  xlim = c(0, 60),
+  break.time.by = 12,
+  palette = um_colors,
+  legend.labs = c(
+    "Sunitinib",
+    "Avelumab + Axitinib"
+      ),
+  surv.scale = "percent",
+  ggtheme = theme_minimal(base_size = 14)
+)
+
+pfsi<-ggsurvplot(
+  survfit(Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD, data = fpfsi),
+  data = fpfsi,
+  risk.table = TRUE,
+  title="Intermediate Recurrence (n=139)",
+  xlab = "Time (months)",
+    pval = TRUE,
+  ylab = "Progression Free Survival",
+  # title = "Progression-Free Survival by Recurrence Status",
+  legend.title = "",
+  xlim = c(0, 60),
+  break.time.by = 12,
+  palette = um_colors,
+  legend.labs = c(
+    "Sunitinib",
+    "Avelumab + Axitinib"
+      ),
+  surv.scale = "percent",
+  ggtheme = theme_minimal(base_size = 14)
+)
+
+
+pfsl<-ggsurvplot(
+  survfit(Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD, data = fpfsl),
+  data = fpfsl,
+  risk.table = TRUE,
+    pval = TRUE,
+  title="Late Recurrence (n=144)",
+  xlab = "Time (months)",
+  ylab = "Progression Free Survival",
+  # title = "Progression-Free Survival by Recurrence Status",
+  legend.title = "",
+  xlim = c(0, 60),
+  break.time.by = 12,
+  palette = um_colors,
+  legend.labs = c(
+    "Sunitinib",
+    "Avelumab + Axitinib"
+      ),
+  surv.scale = "percent",
+  ggtheme = theme_minimal(base_size = 14)
+)
+
+pfssubsupp <- plot_grid(
+  pfsd$plot,
+    pfse$plot,
+  pfsd$table,
+   pfse$table,
+  pfsi$plot,pfsl$plot,
+    pfsi$table,
+   pfsl$table,
+  ncol = 2,
+    rel_heights = c(2.5, 1.2,2.5,1.2)
+)
+
+pfssub <- plot_grid(
+  pfsde$plot,
+    pfsil$plot,
+  pfsde$table,
+   pfsil$table,
+  ncol = 2,
+    rel_heights = c(2.5, 1)
+)
+pfssubforest <- plot_grid(
+  pfssub,
+  forestplot,
+  ncol = 1,
+    rel_heights = c(2, 1.5),rel_widths = c(1,1.5)
+)
+
+pfssubsupforest <- plot_grid(
+  pfssubsupp,
+  forestplot,
+  ncol = 1,
+    rel_heights = c(5, 1.5),rel_widths = c(1,1.5)
+)
+
+pfssubsupforest
+pfssubforest
+
+```
+
+
+#Interaction Assessment
+``` {r interaction assessment }
+
+# assess for interaction by using a global interaction test, an ANOVA between the two models
+
+#----------------------------------------------------
+#1) PRIMARY 
+#1) primary analysis sensitivity Assessment of recurrence timing as a continous variable among only recurrent patients (1 df)
+
+fpfsrecur<-subset(fpfs,!fpfs$categories %in% "De Novo Metastatic")
+
+# Reduced model
+cox_no_int <- coxph(
+    Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD + timetotrial + imdc,
+    data = fpfsrecur
+)
+
+# Full model
+cox_int <- coxph(
+    Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD * timetotrial + imdc,
+    data = fpfsrecur
+)
+
+# Global interaction test
+anova(cox_no_int, cox_int)
+#----------------------------------------------------
+#2) Secondary biologic grouping: Assessment of recurrence timing as a binary variable (denovo|early vs int|late)
+
+fpfs$comb<-fpfs$categories %in% c("De Novo Metastatic","early")
+
+# Reduced model
+cox_no_int <- coxph(
+    Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD + comb + imdc,
+    data = fpfs
+)
+
+# Full model
+cox_int <- coxph(
+    Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD * comb + imdc,
+    data = fpfs
+)
+
+# Global interaction test
+anova(cox_no_int, cox_int)
+
+#----------------------------------------------------
+#3)  Interaction Analysis is Time to Recurrecne Continous (1 df)
+
+# Reduced model
+cox_no_int <- coxph(
+    Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD + timetotrialinc + imdc,
+    data = fpfs
+)
+
+# Full model
+cox_int <- coxph(
+    Surv(as.numeric(AVALC), CNSR == "0") ~ ARMCD * timetotrialinc + imdc,
+    data = fpfs
+)
+
+# Global interaction test
+anova(cox_no_int, cox_int) 
+
+
+
+```
+
+#ORR by recurrence category
+``` {r ORR}
+
+#ORR plot
+# (Optional) set display order
+
+finalorr<-subset(final,!final$orr %in% c("--redacted--","NOT EVALUABLE"))
+cat_order  <- c( "De Novo Metastatic","early", "intermediate", "late")
+orr_order  <- c( "COMPLETE RESPONSE", 
+                "PARTIAL RESPONSE", "STABLE DISEASE", "PROGRESSIVE DISEASE")
+
+df_prop <- finalorr %>%
+  mutate(
+    categories = factor(categories, levels = cat_order),
+    orr        = factor(orr,        levels = orr_order)
+  ) %>%
+  count(categories, ARM, orr, name = "n") %>%
+  group_by(categories, ARM) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+
+
+# ORR (CR+PR) box (ymin at top of SD+PD, ymax at top of stack)
+df_box <- df_prop %>%
+  group_by(categories, ARM) %>%
+  summarise(
+    ymin = sum(prop[orr %in% c("STABLE DISEASE", "PROGRESSIVE DISEASE")]),
+    ymax = ymin + sum(prop[orr %in% c("COMPLETE RESPONSE", "PARTIAL RESPONSE")]),
+    .groups = "drop"
+  ) %>%
+  mutate(highlight = "ORR (CR + PR)")
+
+# PD box (ymin at top of CR+PR+SD, ymax at end of PD)
+df_box_pd <- df_prop %>%
+  group_by(categories, ARM) %>%
+  summarise(
+    pd   = sum(prop[orr == "PROGRESSIVE DISEASE"]),
+    ymin = 0,
+    ymax = ymin + pd,
+    .groups = "drop"
+  ) %>%
+  filter(pd > 0) %>%                        # skip zero-height rectangles
+  mutate(highlight = "PD rate")
+# --- Standard error for ORR and PD ---
+df_counts <- df_prop %>%
+  group_by(categories, ARM) %>%
+  summarise(
+    N     = sum(n),
+    p_ORR = sum(n[orr %in% c("COMPLETE RESPONSE","PARTIAL RESPONSE")]) / N,
+    p_PD  = sum(n[orr == "PROGRESSIVE DISEASE"]) / N,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    se_ORR = sqrt(p_ORR * (1 - p_ORR) / N),
+    se_PD  = sqrt(p_PD  * (1 - p_PD ) / N),
+    
+    # map ORR SE to the top-of-stack ORR box (same region as your ORR rectangle)
+    ylow_ORR  = pmax(0, 1 - pmin(1, p_ORR + se_ORR)),
+    yhigh_ORR = pmin(1, 1 - pmax(0, p_ORR - se_ORR)),
+    
+    # PD SE (two options):
+    # 1) baseline-anchored (matches your current PD rectangle with ymin=0)
+    ylow_PD_base  = pmax(0, p_PD - se_PD),
+    yhigh_PD_base = pmin(1, p_PD + se_PD),
+    
+    # 2) top-of-stack (use if you change PD rectangle to sit on the PD segment)
+    ylow_PD_top  = pmax(0, 1 - pmin(1, p_PD + se_PD)),
+    yhigh_PD_top = pmin(1, 1 - pmax(0, p_PD - se_PD))
+  )
+
+# ---- Add the SE error bars to your existing plot ----
+
+df_prop$categories <- factor(df_prop$categories,
+                             levels = c("De Novo Metastatic","early","intermediate","late"),
+                             labels = c("De Novo\nMetastatic",
+                                        "Early\nRecurrent",
+                                        "Intermediate\nRecurrent",
+                                        "Late\nRecurrent"))
+df_counts$categories <- factor(df_counts$categories,
+                             levels = c("De Novo Metastatic","early","intermediate","late"),
+                             labels = c("De Novo\nMetastatic",
+                                        "Early\nRecurrent",
+                                        "Intermediate\nRecurrent",
+                                        "Late\nRecurrent"))
+
+ORRPlot<-ggplot(
+  df_prop,
+  aes(x = categories, y = prop, fill = orr)
+) +
+  geom_col() +
+  # ORR outline
+  geom_rect(
+    data = df_box,
+    aes(
+      xmin = as.numeric(categories) - 0.4,
+      xmax = as.numeric(categories) + 0.4,
+      ymin = ymin,
+      ymax = ymax,
+      color = highlight
+    ),
+    inherit.aes = FALSE,
+    fill = NA,
+    linewidth = 1.1,
+    show.legend = TRUE
+  ) +
+  # PD outline (your current baseline version)
+  geom_rect(
+    data = df_box_pd,
+    aes(
+      xmin = as.numeric(categories) - 0.4,
+      xmax = as.numeric(categories) + 0.4,
+      ymin = ymin,
+      ymax = ymax,
+      color = highlight
+    ),
+    inherit.aes = FALSE,
+    fill = NA,
+    linewidth = 1.1,
+    show.legend = TRUE
+  ) +
+  # ORR SE bars (top-of-stack region)
+  geom_errorbar(
+    data = df_counts %>% mutate(highlight = "ORR (CR + PR)"),
+    aes(x = categories, ymin = ylow_ORR, ymax = yhigh_ORR, color = highlight),
+    width = 0.15, linewidth = 0.9, inherit.aes = FALSE
+  ) +
+  # PD SE bars — baseline-anchored to match your PD rectangle
+  geom_errorbar(
+    data = df_counts %>% mutate(highlight = "PD rate"),
+    aes(x = categories, ymin = ylow_PD_base, ymax = yhigh_PD_base, color = highlight),
+    width = 0.15, linewidth = 0.9, inherit.aes = FALSE
+  ) +
+
+  scale_y_continuous(labels = scales::label_percent(),breaks = seq(0, 1, 0.20)) +
+
+
+
+  scale_color_manual(
+    name = NULL,
+    values = c("ORR (CR + PR)" = "black",
+               "PD rate"        = "#d73027"),
+    guide = guide_legend(
+      override.aes = list(fill = NA, linewidth = 1.1),
+      order = 2
+    )
+  ) +
+  guides(fill = guide_legend(order = 1)) +
+  labs(
+    x = NULL, y = "Proportion of patients", fill = "Response",
+    title = "Objective Response by Recurrence Timing and Treatment Arm"
+  ) +
+  facet_grid(. ~ ARM, switch = "x",
+             labeller = labeller(
+               ARM = as_labeller(c(
+                 "Avelumab 10 mg/kg IV Q2W in a 6-week cycle + axitinib 5 mg PO BID" =
+                   "Avelumab + Axitinib",
+                 "Sunitinib 50 mg PO QD on Schedule 4/2" =
+                   "Sunitinib"
+               ))
+             ))+
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    strip.placement = "outside",
+    strip.background = element_blank(),
+    panel.grid.major.x = element_blank(),   # remove vertical major gridlines
+    panel.grid.minor.x = element_blank(),   # remove vertical minor gridlines
+    panel.grid.minor.y = element_line(color = "gray20", linewidth = 0.3), # keep horizontal minor
+    panel.grid.major.y = element_line(color = "gray20")   
+  )+
+  scale_fill_manual(
+  values = c(
+    "COMPLETE RESPONSE"    = "#1a9850",
+    "PARTIAL RESPONSE"     = "#a6d96a",
+    "STABLE DISEASE"       = "#ffffbf",
+    "PROGRESSIVE DISEASE"  = "#f46d43"
+  )
+)+
+  geom_vline(xintercept = 4.7, linewidth = 0.8, color = "black")
+
+ORRPlot
+
+```
+``` {r site and late recurrence}
+
+
+angiosite<-ggplot(final, aes(x = timetotrial, y = angio,colour=sitespecclean)) +
+    geom_point(alpha = 0.7)  +
+    scale_x_continuous(
+        breaks = c(0,60,120,180,240,300),
+        labels = c("0","60","120","180","240",300)
+    ) +  
+    # scale_color_manual(
+    #     values = c(
+    #         "KIDNEY" = "#4d9221",
+    #         "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Angiogenesis",
+        colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,300)) +
+    theme_minimal()+
+    theme(legend.position="none")
+
+cellcyclesite<-ggplot(final, aes(x = timetotrial, y = cellcycle,colour=sitespecclean)) +
+    geom_point(alpha = 0.7)  +
+    scale_x_continuous(
+        breaks = c(0,60,120,180,240,300),
+        labels = c("0","60","120","180","240",300)
+    ) +  
+    # scale_color_manual(
+    #     values = c(
+    #         "KIDNEY" = "#4d9221",
+    #         "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "Cell Cycle",
+        colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-3,3), xlim = c(0,300)) +
+    theme_minimal()
+
+site25years <- plot_grid(
+  angiosite,
+  cellcyclesite,
+  ncol = 2,
+    rel_heights = c(1, 1),rel_widths = c(1,1.3)
+)
+
+
+
+
+fit <- lm(g15 ~ timetotrial + site, data = final)
+# fit <- lm(emt ~ timetotrial + site, data = final)
+
+summary(fit)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+fit_reduced <- lm(g15 ~ site, data = final[!is.na(final$timetotrial),])
+anova(fit_reduced, fit, test= "LRT")
+
+
+final$predg15<-predict(fit,newdata = final)
+
+# final$partial_angio <- resid(fit) + coef(fit)["timetotrial"] * final$timetotrial
+
+p_label <- "p = 0.065"
+
+summary(fit)
+
+g15cont <- ggplot(final, aes(x = timetotrialcut, y = g15,colour=site)) +
+    geom_point(alpha = 0.7) +geom_line(aes(x=timetotrial,y=predg15),linewidth = 1.2) +
+    annotate("text",
+             x = 40,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +  
+    scale_color_manual(
+        values = c(
+            "KIDNEY" = "#4d9221",
+            "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "15 Gene Score",
+        colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-22,20), xlim = c(0,120)) +
+    theme_minimal()
+
+
+
+fit <- lm(emt ~ timetotrial + site, data = final)
+# fit <- lm(emt ~ timetotrial + site, data = final)
+
+summary(fit)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+fit_reduced <- lm(emt ~ site, data = final[!is.na(final$timetotrial),])
+anova(fit_reduced, fit, test= "LRT")
+
+
+final$predemt<-predict(fit,newdata = final)
+
+# final$partial_angio <- resid(fit) + coef(fit)["timetotrial"] * final$timetotrial
+
+p_label <- "p = 8e-7"
+
+summary(fit)
+
+emtcont <- ggplot(final, aes(x = timetotrialcut, y = emt,colour=site)) +
+    geom_point(alpha = 0.7) +geom_line(aes(x=timetotrial,y=predemt),linewidth = 1.2) +
+    annotate("text",
+             x = 40,
+             y = 2.2,
+             label = p_label,
+             hjust = 0,
+             size = 4) +
+    scale_x_continuous(
+        breaks = c(0,30,60,90,120),
+        labels = c("0","30","60","90",">120")
+    ) +  
+    scale_color_manual(
+        values = c(
+            "KIDNEY" = "#4d9221",
+            "METASTASIS" = "#c51b7d"        ))+
+    labs(
+        x = "Recurrence Time (months)",
+        y = "EMT Score",
+        colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-30,30), xlim = c(0,120)) +
+    theme_minimal()
+
+emtcont
+
+
+fit <- lm(emt ~ categories_model + site, data = final)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+final$predemtcat<-predict(fit,newdata = final)
+summary(fit)
+# Reduced model (no recurrence timing)
+fit_reduced <- lm(emt ~ site, data = final)
+anova(fit_reduced, fit, test= "LRT")
+
+
+
+
+calipers <- data.frame(
+  group1 = c("late","late","late"),
+  group2 = c("De Novo Metastatic","early","intermediate"),
+  p = c(0.0007,8.3e-05,0.00012)
+) |>
+  filter(p < 0.05)
+
+
+
+calipers$y.position <- c(17.1,20.5,23.9)
+calipers$label <- sprintf("p = %.2g", calipers$p)
+
+
+emtcat<-ggplot(final, aes(x = categories_plot, y = emt)) +
+      geom_beeswarm(
+    aes(color = site),size = 1.5,alpha=0.7,method="center")+
+  geom_line(aes(y=predemtcat,group=site,colour=site),linewidth = 1.2)+
+    geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.6) +
+
+    stat_pvalue_manual(
+        calipers,
+        label = "label",
+        tip.length = 0.01
+    ) +  
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"
+                 ))+
+    scale_x_discrete(
+        labels = c(
+            "De Novo Metastatic" = "DeNovo",
+            "early" = "Early",
+            "intermediate" = "Intermediate",
+            "late" = "Late"
+        )
+    ) +
+    labs(
+        x = NULL,
+        y = "EMT",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-40, 40)) +
+    theme_minimal()
+
+
+
+fit <- lm(g15 ~ categories_model + site, data = final)
+cbind(
+  coef(fit),
+  confint(fit)
+)
+
+final$predg15cat<-predict(fit,newdata = final)
+summary(fit)
+# Reduced model (no recurrence timing)
+fit_reduced <- lm(g15 ~ site, data = final)
+anova(fit_reduced, fit, test= "LRT")
+
+
+
+
+calipers <- data.frame(
+  group1 = c("late","late","late"),
+  group2 = c("De Novo Metastatic","early","intermediate"),
+  p = c(0.34,0.039,0.0043)
+) |>
+  filter(p < 0.05)
+
+
+
+calipers$y.position <- c(15.1,17.5)
+calipers$label <- sprintf("p = %.2g", calipers$p)
+
+
+g15cat<-ggplot(final, aes(x = categories_plot, y = g15)) +
+      geom_beeswarm(
+    aes(color = site),size = 1.5,alpha=0.7,method="center")+
+  geom_line(aes(y=predg15cat,group=site,colour=site),linewidth = 1.2)+
+    geom_boxplot(outlier.shape = NA, alpha = 0.3, width = 0.6) +
+
+    stat_pvalue_manual(
+        calipers,
+        label = "label",
+        tip.length = 0.01
+    ) +  
+  scale_color_manual(
+                 values = c(
+                     "KIDNEY" = "#4d9221",
+                     "METASTASIS" = "#c51b7d"
+                 ))+
+    scale_x_discrete(
+        labels = c(
+            "De Novo Metastatic" = "DeNovo",
+            "early" = "Early",
+            "intermediate" = "Intermediate",
+            "late" = "Late"
+        )
+    ) +
+    labs(
+        x = NULL,
+        y = "15 Gene Score",
+  colour = "Sequencing\nSite"
+    ) +
+    coord_cartesian(ylim = c(-22, 20)) +
+    theme_minimal()
+
+g15emtcomb <- plot_grid(
+  g15cont,g15cat,
+  emtcont,emtcat,
+  ncol = 2,
+    rel_heights = c(1, 1),rel_widths = c(1,1)
+)
+
+
+
+```
